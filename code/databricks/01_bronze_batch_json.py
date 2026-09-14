@@ -35,6 +35,8 @@ BRONZE_SCHEMA = "deriv_assement_bronze"
 
 BASE_PATH = "/Volumes/workspace/deriv_assement/data/batch"
 
+ARCHIVE_PATH = "/Volumes/workspace/deriv_assement/data/archive"
+
 MASTER_TABLE = f"{CATALOG}.{BRONZE_SCHEMA}.bronze_load_master"
 HISTORY_TABLE = f"{CATALOG}.{BRONZE_SCHEMA}.bronze_load_history"
 
@@ -246,6 +248,55 @@ def update_master_success(
     )
 
 
+def archive_source_files(table_name, source_files, delta_created_ts):
+    """
+    Move consumed source files to the archive volume.
+
+    Called ONLY after the Bronze write and the master update have succeeded, so a
+    failed load always leaves its files in place to be re-driven on the next run.
+
+    Files are archived under one folder per load batch:
+
+        {ARCHIVE_PATH}/{table_name}/{yyyyMMddHHmmss}/{file_name}
+
+    The batch folder is stamped with delta_created_ts, which is the same value
+    written to bronze_load_master.latest_loaded_ts. That is what lets you walk back
+    from any Bronze row to the exact file it came from.
+    """
+    batch_folder = delta_created_ts.strftime("%Y%m%d%H%M%S")
+    archive_dir = f"{ARCHIVE_PATH}/{table_name}/{batch_folder}"
+
+    dbutils.fs.mkdirs(archive_dir)
+
+    archived = []
+    failed = []
+
+    for source_file in sorted(source_files):
+        file_name = source_file.rstrip("/").split("/")[-1]
+        destination = f"{archive_dir}/{file_name}"
+
+        try:
+            dbutils.fs.mv(source_file, destination)
+            archived.append(destination)
+        except Exception as exc:
+            # Bronze already holds this data, so an archive failure must not fail the
+            # load. It does need to be visible: the file stays in the landing folder
+            # and will be picked up again next run. The master-driven read in the
+            # Silver notebooks filters on delta_created_ts, so the duplicate Bronze
+            # rows that creates are inert rather than corrupting.
+            failed.append(f"{source_file} -> {exc}")
+
+    print(f"Archived     : {len(archived)} file(s) to {archive_dir}")
+
+    if failed:
+        print(f"[WARN] {len(failed)} file(s) could not be archived and will be "
+              f"re-ingested on the next run:")
+        for entry in failed:
+            print(f"         {entry}")
+
+    return archived
+
+
 def load_json_to_bronze(table_name, source_path, target_table):
     load_id = str(uuid.uuid4())
 
@@ -262,6 +313,42 @@ def load_json_to_bronze(table_name, source_path, target_table):
         print(f"Table        : {table_name}")
         print(f"Source       : {source_path}")
         print(f"Target       : {target_table}")
+
+        # Once files are archived the landing folder is normally empty, which is a
+        # no-op rather than a failure. Detect it before spark.read, which would
+        # otherwise raise on a path with no files and mark the load FAILED.
+        landing_dir = source_path.rsplit("/", 1)[0]
+        try:
+            pending = [f for f in dbutils.fs.ls(landing_dir) if f.name.endswith(".json")]
+        except Exception:
+            pending = []
+
+        if not pending:
+            load_end_ts = spark.sql("SELECT current_timestamp() AS ts").first()["ts"]
+
+            # No files means nothing to record: the master row keeps pointing at the
+            # last real batch, so downstream reads are unaffected.
+            append_load_history(
+                load_id=load_id,
+                table_name=table_name,
+                source_path=source_path,
+                load_start_ts=load_start_ts,
+                load_end_ts=load_end_ts,
+                delta_created_ts=delta_created_ts,
+                records_loaded=0,
+                source_files=None,
+                load_status="NO_FILES",
+                error_message=None,
+            )
+
+            print(f"Status       : NO_FILES (landing folder empty, nothing to load)")
+
+            return {
+                "load_id": load_id,
+                "table_name": table_name,
+                "status": "NO_FILES",
+                "records_loaded": 0,
+            }
 
         # Read all JSON files matching the configured path.
         source_df = (
@@ -345,6 +432,14 @@ def load_json_to_bronze(table_name, source_path, target_table):
             source_files=source_files_string,
             load_status="SUCCESS",
             error_message=None,
+        )
+
+        # Archive the consumed files last: Bronze is durable and the master is
+        # advanced, so the landing folder can safely be drained.
+        archive_source_files(
+            table_name=table_name,
+            source_files=source_files,
+            delta_created_ts=delta_created_ts,
         )
 
         print(f"Status       : SUCCESS")
@@ -466,7 +561,13 @@ for config in TABLE_CONFIG:
 # MAGIC 4. `_source_file` provides source-file lineage for every Bronze record.
 # MAGIC 5. `delta_created_ts` identifies the ingestion batch timestamp.
 # MAGIC 6. `delta_created_dt` is useful for date-level pruning.
-# MAGIC 7. Partitioning by a high-cardinality timestamp can create many small
+# MAGIC 7. Consumed files are moved to `/Volumes/workspace/deriv_assement/data/archive/`
+# MAGIC    under `{table_name}/{yyyyMMddHHmmss}/`, stamped with the same
+# MAGIC    `delta_created_ts` written to the master table. Archiving runs only after a
+# MAGIC    successful Bronze write, so a failed load leaves its files to be re-driven.
+# MAGIC 8. An empty landing folder is reported as `NO_FILES`, not `FAILED`, and does
+# MAGIC    not advance the master timestamp.
+# MAGIC 9. Partitioning by a high-cardinality timestamp can create many small
 # MAGIC    partitions. In a production design, normally partition only by
 # MAGIC    `delta_created_dt` and retain `delta_created_ts` as a regular column.
 # MAGIC 8. This notebook intentionally performs append-style Bronze ingestion.
