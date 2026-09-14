@@ -164,16 +164,29 @@ dimension row with `is_inferred = TRUE`, `full_name = 'UNKNOWN'`, `risk_category
 and `valid_from = '1900-01-01'` so it covers any historical fact date. The fact loads
 immediately with a valid `client_sk`; totals stay complete.
 
-When the real dimension record arrives, the stub is **upgraded in place** — the same
-`client_sk` is updated with real attributes and `is_inferred` cleared. Because the
-surrogate key never changes, **facts already loaded do not need restating**. That is the
-whole point of using a surrogate key rather than the natural key on the fact.
+When the real dimension record arrives, the stub is **upgraded in place** — the merge in
+`05_gold_dimensional.py` reads `dim_client_current` and updates the same `client_sk` with
+real attributes, clearing `is_inferred`. Because the surrogate key never changes, **facts
+already loaded do not need restating**. That is the whole point of using a surrogate key
+rather than the natural key on the fact.
 
-Verified: `Inferred dimension member created for late/unknown client CL031`.
+**What actually happens on this data — and why the count is zero.** Both orphans are
+stopped one layer earlier, at the Silver DQ gate (Part 1a.5, EC-4): `VDEP020` and `DEP020`
+are quarantined on `client_exists` and never reach Gold, so the current build creates
+**0 inferred members**. That is the designed order of precedence, not a dormant feature:
+quarantine is preferable while the client might still arrive, because it keeps a known-bad
+row out of the star entirely and releases it automatically once the dimension catches up.
+The inferred member exists for the orphan that gets past that gate — a client released
+mid-run, a dimension row retracted after the fact loaded, or a feed where the orphan is
+merely late rather than wrong. Dropping the fact or nulling the FK would still be wrong in
+those cases, which is why the mechanism is built rather than deferred.
 
 Inferred members are monitored: an inferred row older than 7 days means the dimension feed
-is genuinely broken, not merely late, and alerts. Without that, the stub mechanism quietly
-hides a broken upstream.
+is genuinely broken, not merely late, and alerts. The same ageing rule covers unresolved
+quarantine rows. Without both, either mechanism quietly hides a broken upstream.
+
+The invariant that matters is asserted after every Gold build: `fact_deposit` must carry
+**zero null `client_sk`**. It does.
 
 One temporal nuance this surfaces: `TRD005` is a trade by `CL007` on **2024-02-20**, but
 `CL007`'s `signup_date` is **2024-03-15** — activity 24 days before the client existed.

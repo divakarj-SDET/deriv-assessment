@@ -219,9 +219,11 @@ Reasoning grounded in what this assessment's data actually shows:
 - Onboarding a payment processor is a recurring event, not a one-off. The second and third
   processors cost near-zero on a platform and a full sprint each if hand-built.
 - We already have Auto Loader doing this competently for the current feed
-  (`02_bronze_streaming_autoloader.py`), which means the incremental case for a paid
-  platform is weaker than it would be from a standing start — a point worth making to
-  whoever is approving the spend.
+  (`02_bronze_streaming_autoloader.py`, deployed as the continuous job in
+  `create_job_streaming.json`), which means the incremental case for a paid platform is
+  weaker than it would be from a standing start — onboarding processor number two is
+  another landing folder and another Auto Loader query, not a new system. Worth making
+  that point to whoever is approving the spend.
 
 This split avoids the trap at both extremes: building undifferentiated plumbing, or pushing
 business logic into a vendor tool where it becomes unversioned, untestable, and invisible
