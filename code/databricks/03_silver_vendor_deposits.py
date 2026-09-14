@@ -27,6 +27,7 @@ import uuid
 CATALOG = "workspace"
 BRONZE = f"{CATALOG}.deriv_assement_bronze"
 SILVER = f"{CATALOG}.deriv_assement_silver"
+MASTER = f"{BRONZE}.bronze_load_master"
 
 RUN_ID = str(uuid.uuid4())
 
@@ -41,10 +42,51 @@ spark.sql(f"CREATE SCHEMA IF NOT EXISTS {SILVER}")
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ### Master-driven Bronze read
+# MAGIC
+# MAGIC `bronze_load_master` holds one row per batch-loaded Bronze table, and
+# MAGIC `latest_loaded_ts` is advanced only after a successful Bronze write (notebook 01).
+# MAGIC Reading at that timestamp is what makes Silver deterministic: Bronze is
+# MAGIC append-only, so an unfiltered read returns every historical load stacked up and
+# MAGIC a re-run of 01 silently doubles the rows.
+# MAGIC
+# MAGIC A missing or non-SUCCESS master row is BLOCK severity, not a silent empty read.
+
+# COMMAND ----------
+
+def read_bronze(table):
+    """Read a batch-loaded Bronze table at its latest successful load timestamp."""
+    row = (spark.table(MASTER)
+           .filter(F.col("table_name") == F.lit(table))
+           .select("latest_loaded_ts", "last_load_status")
+           .first())
+
+    if row is None:
+        raise Exception(
+            f"[BLOCK] No {MASTER} row for '{table}'. Bronze has never loaded it "
+            f"successfully. Run notebook 01 before this one."
+        )
+    if row["last_load_status"] != "SUCCESS":
+        raise Exception(
+            f"[BLOCK] Latest load of '{table}' is {row['last_load_status']}, not SUCCESS. "
+            f"Silver refuses to read a failed batch."
+        )
+
+    return (spark.table(f"{BRONZE}.{table}")
+            .filter(F.col("delta_created_ts") == F.lit(row["latest_loaded_ts"])))
+
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## 1. Read Bronze and normalise schema drift
 
 # COMMAND ----------
 
+# Streaming Bronze, NOT master-driven: the Auto Loader checkpoint in notebook 02
+# already guarantees each vendor file is ingested once, and Silver must see every
+# file at once for cross-file dedup (VDEP002/VDEP005 span 0301 and 0302). Filtering
+# to one micro-batch would break that.
 raw = spark.table(f"{BRONZE}.stream_client_deposits")
 
 present = set(raw.columns)
@@ -98,7 +140,10 @@ normalised = (
 
 # COMMAND ----------
 
-signup = spark.table(f"{BRONZE}.client_signup").select(
+# Read at the master watermark, so a re-run of notebook 01 cannot fan out this join
+# or break the quarantine-release MERGE with
+# DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE.
+signup = read_bronze("client_signup").select(
     "client_id", "signup_date", "kyc_status")
 
 j = normalised.join(signup, "client_id", "left")
@@ -245,7 +290,7 @@ display(spark.sql(f"""
 # COMMAND ----------
 
 q = DeltaTable.forName(spark, f"{SILVER}.quarantine_deposit")
-(q.alias("q").merge(signup.select("client_id").alias("c"),
+(q.alias("q").merge(signup.select("client_id").distinct().alias("c"),
                     "q.client_id = c.client_id AND q.resolved_at IS NULL")
  .whenMatchedUpdate(set={"resolved_at": "current_timestamp()"})
  .execute())

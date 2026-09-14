@@ -22,6 +22,44 @@ BRONZE, SILVER, GOLD = (f"{CATALOG}.deriv_assement_bronze",
                         f"{CATALOG}.deriv_assement_silver",
                         f"{CATALOG}.deriv_assement_gold")
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {GOLD}")
+MASTER = f"{BRONZE}.bronze_load_master"
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Master-driven Bronze read
+# MAGIC
+# MAGIC `bronze_load_master` holds one row per batch-loaded Bronze table, and
+# MAGIC `latest_loaded_ts` is advanced only after a successful Bronze write (notebook 01).
+# MAGIC Reading at that timestamp is what makes Silver deterministic: Bronze is
+# MAGIC append-only, so an unfiltered read returns every historical load stacked up and
+# MAGIC a re-run of 01 silently doubles the rows.
+# MAGIC
+# MAGIC A missing or non-SUCCESS master row is BLOCK severity, not a silent empty read.
+
+# COMMAND ----------
+
+def read_bronze(table):
+    """Read a batch-loaded Bronze table at its latest successful load timestamp."""
+    row = (spark.table(MASTER)
+           .filter(F.col("table_name") == F.lit(table))
+           .select("latest_loaded_ts", "last_load_status")
+           .first())
+
+    if row is None:
+        raise Exception(
+            f"[BLOCK] No {MASTER} row for '{table}'. Bronze has never loaded it "
+            f"successfully. Run notebook 01 before this one."
+        )
+    if row["last_load_status"] != "SUCCESS":
+        raise Exception(
+            f"[BLOCK] Latest load of '{table}' is {row['last_load_status']}, not SUCCESS. "
+            f"Silver refuses to read a failed batch."
+        )
+
+    return (spark.table(f"{BRONZE}.{table}")
+            .filter(F.col("delta_created_ts") == F.lit(row["latest_loaded_ts"])))
+
 
 # COMMAND ----------
 
@@ -92,7 +130,7 @@ dim = DeltaTable.forName(spark, f"{GOLD}.dim_client")
 # COMMAND ----------
 
 dates = (spark.table(f"{SILVER}.silver_deposit").select(F.col("deposit_date").alias("d"))
-         .union(spark.table(f"{BRONZE}.client_trades").select(F.col("trade_date").cast("date")))
+         .union(read_bronze("client_trades").select(F.col("trade_date").cast("date")))
          .filter("d IS NOT NULL").distinct())
 
 (dates.withColumn("date_key", F.date_format("d", "yyyyMMdd").cast("int"))
@@ -142,7 +180,7 @@ fact_dep = (spark.table(f"{SILVER}.silver_deposit").filter("is_quarantined = FAL
 inst = spark.table(f"{GOLD}.dim_instrument").select(
     "instrument_key", F.col("instrument").alias("i_instrument"), "contract_size")
 
-fact_trd = (spark.table(f"{BRONZE}.client_trades")
+fact_trd = (read_bronze("client_trades")
             .join(dc, F.col("client_id") == F.col("dc_client_id"), "left")
             .join(inst, F.col("instrument") == F.col("i_instrument"), "left")
             .withColumn("trade_sk", F.sha2(F.col("trade_id"), 256))

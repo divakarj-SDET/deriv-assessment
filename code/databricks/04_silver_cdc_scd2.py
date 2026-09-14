@@ -32,6 +32,44 @@ APPLY_LOG = f"{SILVER}.cdc_apply_log"
 END_OF_TIME = "9999-12-31 00:00:00"
 
 TRACKED = ["risk_category", "account_balance_usd", "account_status"]
+MASTER = f"{BRONZE}.bronze_load_master"
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Master-driven Bronze read
+# MAGIC
+# MAGIC `bronze_load_master` holds one row per batch-loaded Bronze table, and
+# MAGIC `latest_loaded_ts` is advanced only after a successful Bronze write (notebook 01).
+# MAGIC Reading at that timestamp is what makes Silver deterministic: Bronze is
+# MAGIC append-only, so an unfiltered read returns every historical load stacked up and
+# MAGIC a re-run of 01 silently doubles the rows.
+# MAGIC
+# MAGIC A missing or non-SUCCESS master row is BLOCK severity, not a silent empty read.
+
+# COMMAND ----------
+
+def read_bronze(table):
+    """Read a batch-loaded Bronze table at its latest successful load timestamp."""
+    row = (spark.table(MASTER)
+           .filter(F.col("table_name") == F.lit(table))
+           .select("latest_loaded_ts", "last_load_status")
+           .first())
+
+    if row is None:
+        raise Exception(
+            f"[BLOCK] No {MASTER} row for '{table}'. Bronze has never loaded it "
+            f"successfully. Run notebook 01 before this one."
+        )
+    if row["last_load_status"] != "SUCCESS":
+        raise Exception(
+            f"[BLOCK] Latest load of '{table}' is {row['last_load_status']}, not SUCCESS. "
+            f"Silver refuses to read a failed batch."
+        )
+
+    return (spark.table(f"{BRONZE}.{table}")
+            .filter(F.col("delta_created_ts") == F.lit(row["latest_loaded_ts"])))
+
 
 # COMMAND ----------
 
@@ -45,7 +83,7 @@ TRACKED = ["risk_category", "account_balance_usd", "account_status"]
 # COMMAND ----------
 
 if not spark.catalog.tableExists(DIM):
-    seed = (spark.table(f"{BRONZE}.client_profile")
+    seed = (read_bronze("client_profile")
             .select("client_id", "full_name", F.col("date_of_birth").cast("date"),
                     "nationality", "risk_category",
                     F.col("account_balance_usd").cast("decimal(18,2)"),
@@ -81,6 +119,9 @@ spark.sql(f"""CREATE TABLE IF NOT EXISTS {APPLY_LOG} (
 
 watermark = spark.sql(f"SELECT COALESCE(MAX(lsn), 0) AS m FROM {APPLY_LOG}").first()["m"]
 
+# Streaming Bronze, NOT master-driven: the Auto Loader checkpoint already ingests
+# each change file once, and the `lsn` watermark below is this notebook's own
+# incremental boundary. A delta_created_ts filter would hide un-applied changes.
 cdc = (spark.table(f"{BRONZE}.stream_client_profile_changes")
        .filter(F.col("lsn") > F.lit(watermark))
        .withColumn("commit_ts", F.col("commit_ts").cast("timestamp"))
