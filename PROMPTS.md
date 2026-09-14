@@ -139,6 +139,14 @@ with a derived USD figure.
 7-day ageing alert, because a stub mechanism with no monitoring silently hides a broken
 dimension feed — the AI presented inferred members as a complete solution.
 
+**What running it then corrected in my own writing.** I had documented the inferred member
+as the handling for `CL099` and `CL031`, and quoted a log line asserting one was created.
+The prototype creates **zero** — both orphans are quarantined at the Silver DQ gate and
+never reach Gold. The mechanism is right and the precedence is right; the claim was simply
+not what the code does. It is now documented as the second layer, with the zero count
+stated explicitly, which is a stronger answer than the one I had written from the design
+rather than from the run.
+
 ---
 
 ## Part 2b — Historization / SCD
@@ -223,6 +231,45 @@ the recommendation in what this assessment's own data shows: the hard problems h
 backdated file, the renamed column, the duplicate rows and the id-namespace mismatch — and
 **no integration platform solves any of them**. That is what drives the split recommendation
 (buy the transport, build the transformation) rather than a straight build-or-buy verdict.
+
+---
+
+## Orchestration — Lakeflow jobs and the streaming trigger
+
+**Prompt:**
+> "Write a Databricks job definition that runs an Auto Loader streaming notebook
+> continuously and then runs the Silver, Gold and reconciliation notebooks after it."
+
+**What came back:** a single job with the streaming notebook as task one and the batch
+notebooks chained behind it with `depends_on`.
+
+**Rejected — it cannot work.** A continuous task never reaches a terminal state, so the
+dependent tasks would never start. The batch half of that DAG would sit pending forever
+while looking, on the job page, like a healthy run. I split it into two definitions: a
+single-task continuous job for Bronze ingestion, and a file-arrival job for
+`01 → 03 → 04 → 05 → 06`.
+
+**What I added that the prompt did not ask for:**
+
+1. **A `trigger_mode` widget on the streaming notebook.** The same notebook has to drain
+   and stop when run as a task, and run forever when run as the continuous job. Editing the
+   trigger by hand between the two is how a debugging change gets committed by accident, so
+   the job supplies the mode as a parameter.
+2. **`awaitAnyTermination()` instead of awaiting each query.** Awaiting the deposit query
+   at the point it is started deadlocks in continuous mode — the call never returns, so the
+   CDC query never starts and that feed silently ingests nothing. `awaitAnyTermination`
+   also fails the run when *either* query dies, rather than letting a healthy stream mask
+   a dead one.
+3. **Archive path outside the trigger's watched path.** The batch job triggers on file
+   arrival in the landing volume and notebook `01` drains consumed files. Archiving inside
+   the watched path would make the job re-trigger itself indefinitely.
+4. **Per-task retry policy, not a uniform one.** Reconciliation is `max_retries: 0`,
+   because it appends evidence keyed by `run_id` — a retry leaves two sets of break rows
+   for one logical run and makes the audit trail lie. The AI's default gave every task the
+   same retry count.
+
+Both jobs ship `PAUSED`. A job definition in a repo should not start moving data because
+someone imported it.
 
 ---
 

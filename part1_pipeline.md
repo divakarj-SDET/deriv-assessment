@@ -20,7 +20,7 @@ without a corresponding line of output.
 | **Bronze** | `workspace.deriv_assement_bronze.*` | Append-only typed-as-string capture + lineage columns (`_source_file`, `delta_created_ts`, `row_hash`). No business rules. | Append-only |
 | **Silver** | `workspace.deriv_assement_silver.*` | Schema-drift normalisation, typing, DQ gate, deduplication, idempotent `MERGE` on the business key. CDC applied here into SCD2. | Merge target |
 | **Gold** | `workspace.deriv_assement_gold.*` | Kimball star: conformed dimensions + fact tables at declared grain. | Rebuildable |
-| **Control** | `workspace.deriv_assement_bronze.bronze_load_master` / `_history`, `ingest_file_manifest`, `cdc_apply_log`, `dq_result`, `quarantine_deposit`, `reconciliation_result` | Watermarks, file manifest, DQ evidence, recon breaks. | Mixed |
+| **Control** | `workspace.deriv_assement_bronze.bronze_load_master` / `bronze_load_history` / `streaming_load_history`, `ingest_file_manifest`, `cdc_apply_log`, `dq_result`, `quarantine_deposit`, `reconciliation_result` | Batch watermark + per-attempt batch history, per-micro-batch streaming history, file manifest, CDC watermark, DQ evidence, recon breaks. | Mixed |
 
 The Bronze layer and its control tables already exist in
 `code/databricks/01_bronze_batch_json.py` and `02_bronze_streaming_autoloader.py`.
@@ -264,7 +264,7 @@ historical revenue.
 |---|---|
 | **For** | History and audit trail intact; prior-period reports remain reproducible; facts never orphan; supports "what did we know on date X". |
 | **Against** | The dimension grows monotonically; every consumer must filter `is_deleted = FALSE` or they will double-count. Storage and join cost rise. |
-| **Mitigation** | Consumers read a `v_dim_client_current` view with the filter applied — the raw table is reserved for audit and point-in-time queries. |
+| **Mitigation** | Consumers read the `dim_client_current` view (`WHERE is_current AND NOT is_deleted`), created by `04_silver_cdc_scd2.py` and `sql/04`. The raw table is reserved for audit and point-in-time queries, and Gold's stub-upgrade merge reads the view rather than the base table. |
 | **The real tension** | A GDPR erasure request cannot be satisfied by a soft delete. That is handled separately: crypto-shredding of PII columns (`full_name`, `date_of_birth`, `email`) while the surrogate key, the SCD2 timeline and all financial facts survive. Erasing a client must not erase the money. |
 
 A delete is also not always a delete. Debezium-style feeds emit deletes on re-keying
@@ -321,12 +321,25 @@ hash-guarded `MERGE`. Redelivery of an *identical* row is a no-op; redelivery of
 **Why it matters:** an inner join silently drops the row and understates deposits; an
 outer join produces a fact with a null dimension key.
 
-**Handling:** severity-differentiated. The row is **quarantined, not discarded**, and
-re-driven on every subsequent run. If the dimension row arrives later, the deposit flows
-through automatically with no manual replay — this is the late-arriving-dimension case
-from Part 2a viewed from the ingestion side. If it never arrives, the row stays in
-`quarantine_deposit` with an ageing alert, and is bound to an inferred dimension member
-so gold totals stay complete. Verified: 2 quarantined rows (`VDEP020`, `DEP020`).
+**Handling:** two layers, in this order.
+
+1. **Quarantine at the Silver gate.** The row is **withheld, not discarded**, and written
+   to `quarantine_deposit` with `resolved_at = NULL`. A release `MERGE` runs at the end of
+   every Silver run: when the missing `client_id` finally appears in `client_signup`, the
+   quarantine row is stamped `resolved_at` and the deposit flows into Silver on that same
+   run with **no manual replay** (`03_silver_vendor_deposits.py` §5, `sql/02`). Rows still
+   unresolved are reported with an age in days, and past 7 days the report escalates —
+   a dimension feed that is broken looks exactly like one that is merely late until you
+   measure the age.
+2. **Inferred member in Gold.** For an orphan that gets *past* quarantine — a client
+   released mid-run, or a fact whose dimension row is dropped later — Gold binds it to a
+   stub member rather than dropping the fact or nulling the FK. This is the
+   late-arriving-dimension case from Part 2a viewed from the ingestion side.
+
+**Verified on this data:** 2 rows quarantined by this rule (`VDEP020`, `DEP020`), both
+still unresolved because `CL099` and `CL031` never arrive, and **0 inferred members** —
+layer 1 catches both orphans, so layer 2 has nothing to do. `fact_deposit` carries zero
+null `client_sk`, which is the invariant both layers exist to protect.
 
 ### EC-5 — Out-of-order CDC with multiple same-day changes to one key
 
@@ -363,6 +376,47 @@ Two related sub-cases fall out of the same mechanism:
 
 ---
 
+## 1a.6 Orchestration
+
+Two Lakeflow jobs, deliberately separate, in `code/databricks/`.
+
+| Job | Definition | Trigger | Tasks |
+|---|---|---|---|
+| `deriv_assessment_bronze_streaming_continuous` | `create_job_streaming.json` | `continuous` | `02` alone, at `trigger_mode=continuous` |
+| `deriv_assessment_batch_file_arrival` | `create_job_batch.json` | File arrival on the batch landing volume | `01` → `03` → `04` → `05` → `06` |
+
+**Why they are not one job.** A continuous task never reaches a terminal state, so nothing
+can be made to depend on it — a Silver task wired downstream of the streaming task would
+never start. Splitting them means Bronze ingestion stays always-on while Silver and Gold
+run as a bounded DAG that can actually finish, fail, and be retried.
+
+**How the streaming notebook serves both.** `02` reads a `trigger_mode` widget:
+
+- `availableNow` (default) — drain every file currently present, then stop. Both queries
+  terminate, so the notebook can run as an ordinary task and its validation cells execute.
+- `continuous` — micro-batch every minute and block on `awaitAnyTermination()`, which
+  raises as soon as *either* query dies. Without it a healthy deposit stream would mask a
+  dead CDC stream, and that feed would silently ingest nothing.
+
+The mode is a widget rather than an edit to the notebook, because a trigger changed by hand
+for a local test is exactly the kind of thing that gets committed by accident. Every
+micro-batch is recorded in `streaming_load_history`.
+
+**File-arrival rather than a schedule.** The batch job watches the landing volume with
+`min_time_between_triggers_seconds: 60` and `wait_after_last_change_seconds: 30`, so a
+multi-file drop fires one run rather than one run per file. `01` drains consumed files to
+the archive volume, which sits *outside* the watched path — draining the landing folder
+therefore cannot re-trigger the job it belongs to.
+
+**Retry policy is per task, and not uniform.** Bronze retries twice (transient volume and
+cloud-storage errors are genuinely worth retrying). Silver and Gold retry once. **Recon
+does not retry at all**: it appends evidence keyed by `run_id`, so a retry would leave two
+sets of break rows for one logical run and make the audit trail lie. Both jobs ship
+`PAUSED` — a job definition committed to a repo should never start moving data the moment
+someone imports it.
+
+---
+
 ## Data quality safeguards (optional deliverable)
 
 Severity drives a **distinct** action per rule. Nothing is "log and continue".
@@ -383,7 +437,7 @@ Severity drives a **distinct** action per rule. Nothing is "log and continue".
 | `client_exists` | QUARANTINE | Withhold, park for late dimension | `VDEP020`→`CL099`, `DEP020`→`CL031` |
 | `payment_method_present` | QUARANTINE | Withhold, vendor ticket | — (recovered for `DEP012`) |
 | `deposit_not_before_signup` | WARN | Load, flag stewardship | **14 rows**, e.g. `VDEP019` (`CL022`, deposit 2024-02-25, signup 2024-04-20) |
-| `fee_within_tolerance` | WARN | Load, flag finance | `VDEP012` fee 1.60%, `VDEP021` 1.43% vs 1.00% norm |
+| `fee_within_tolerance` | WARN | Load, flag finance | **3 rows**: `VDEP008` 1.67%, `VDEP012` 1.60%, `VDEP021` 1.43% vs the 1.00% norm |
 | `kyc_approved_for_deposit` | WARN | Load, flag to compliance | `VDEP004` (`CL012` = **rejected**), `VDEP009` (`CL026` = **pending**) |
 | `pnl_recomputes` | WARN | Load both values, flag trading ops | `TRD012`: reported **245.00**, derived **0.00** (open = close = 2320.00) |
 | `malformed_key_recovered` | WARN | Load recovered value, raise source fix | `DEP012` |

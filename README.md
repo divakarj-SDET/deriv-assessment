@@ -12,12 +12,12 @@ runnable local prototype in DuckDB so every claim can be verified without a clus
 
 | File | Contents |
 |---|---|
-| **[`part1_pipeline.md`](part1_pipeline.md)** | Architecture, idempotency, late/missing data, source deletes, 5 edge cases, DQ rule register, reconciliation |
+| **[`part1_pipeline.md`](part1_pipeline.md)** | Architecture, idempotency, late/missing data, source deletes, 5 edge cases, DQ rule register, orchestration, reconciliation |
 | **[`part2_data_model.md`](part2_data_model.md)** | Dimensional model + ERD, Kimball vs Data Vault, late-arriving dimensions, SCD choice, merge logic, historical backfill |
 | **[`part3_architecture.md`](part3_architecture.md)** | Unified real-time + batch architecture, latency vs consistency, external API, build vs buy |
 | **[`PROMPTS.md`](PROMPTS.md)** | AI prompts by part, with what I changed, corrected or rejected |
 | `sql/` | DDL, MERGE logic, DQ checks, reconciliation, backfill — all commented |
-| `code/databricks/` | PySpark notebooks, bronze → silver → gold |
+| `code/databricks/` | PySpark notebooks, bronze → silver → gold, plus the two Lakeflow job definitions |
 | `code/prototype/` | Runnable end-to-end prototype (DuckDB) |
 | `data/` | The eight source files |
 
@@ -39,14 +39,14 @@ runnable local prototype in DuckDB so every claim can be verified without a clus
 │   └── 08_backfill_restatement.sql    Reload a date range without corrupting history
 ├── code/
 │   ├── databricks/
-│   │   ├── 01_bronze_batch_json.py            (existing) JSON → Bronze, watermark + archive
-│   │   ├── 02_bronze_streaming_autoloader.py  (existing) Auto Loader → Bronze
-│   │   ├── 03_silver_vendor_deposits.py       DQ gate, dedupe, MERGE
-│   │   ├── 04_silver_cdc_scd2.py              LSN-ordered SCD2 with soft deletes
+│   │   ├── 01_bronze_batch_json.py            JSON → Bronze, watermark + archive drain
+│   │   ├── 02_bronze_streaming_autoloader.py  Auto Loader → Bronze, trigger_mode widget
+│   │   ├── 03_silver_vendor_deposits.py       DQ gate, dedupe, MERGE, quarantine release
+│   │   ├── 04_silver_cdc_scd2.py              LSN-ordered SCD2, soft deletes, current view
 │   │   ├── 05_gold_dimensional.py             Star schema, inferred members, PnL control
 │   │   ├── 06_reconciliation.py               Two-tier reconciliation
-│   │   ├── create_job_streaming.json          Continuous Auto Loader job
-│   │   └── create_job_batch.json              File-arrival batch job (01 → 06)
+│   │   ├── create_job_streaming.json          Continuous job — 02 at trigger_mode=continuous
+│   │   └── create_job_batch.json              File-arrival job — 01 → 03 → 04 → 05 → 06
 │   └── prototype/
 │       └── run_pipeline.py                    Runnable, idempotent, end-to-end
 └── data/                                      Eight source files
@@ -78,7 +78,7 @@ is traceable to a specific record.
 | File delivered 4 days after its newest event | `deposits_vendor_20240303.csv` (events 24–28 Feb) | Event-time windowing + partition restatement |
 | Cross-file duplicate redelivery | `VDEP002`, `VDEP005` | Dedupe on `deposit_id`, hash-guarded MERGE |
 | Negative deposit amount | `VDEP001` = -250.00 | QUARANTINE, vendor ticket |
-| Orphan foreign keys | `VDEP020`→`CL099`, `DEP020`→`CL031` | QUARANTINE + inferred dimension member |
+| Orphan foreign keys | `VDEP020`→`CL099`, `DEP020`→`CL031` | QUARANTINE, auto-released when the client arrives |
 | Malformed JSON key | `DEP012` has `"credit_card"` instead of `payment_method` | Value recovered, source fix raised |
 | CDC out of arrival order | 12 events; `CL001` has 3 same-day changes | Sort by `lsn`, never `commit_ts` |
 | CDC delete | `lsn 1010` → `CL012` | Soft delete: end-date + tombstone |
@@ -93,12 +93,19 @@ is traceable to a specific record.
 ```
 Vendor files       3 files, 24 raw rows → 22 clean → 20 loaded
 DQ                 3 quarantined, 21 warnings, 0 blocking
+silver_deposit     39 rows = 20 vendor ($28,525.00) + 19 warehouse ($121,800.00)
 CDC                12 events applied in LSN order; 1 soft delete, 1 no-op
-dim_client         41 versions across 30 clients + 1 inferred member
+dim_client         41 versions across 30 clients · 0 inferred members
 Reconciliation     Tier 1: 0 matches · Tier 2: 0 matches
                    20 vendor-only, 1 warehouse-only ($350.00, DEP008)
                    Vendor control total: $28,525.00
 ```
+
+`0 inferred members` is the correct outcome, not a gap. Both orphan deposits are stopped
+at the Silver DQ gate, so neither ever reaches Gold needing a stub. The inferred-member
+path is the *second* line of defence — it fires only for an orphan that gets past
+quarantine. Both mechanisms are implemented; on this data only the first one has work to
+do. Detail in [`part1`](part1_pipeline.md) EC-4 and [`part2`](part2_data_model.md) §2a.
 
 **The reconciliation result is the finding, not a failure.** Vendor ids (`VDEP*`) and
 warehouse ids (`DEP*`) share no namespace, and the composite business key produces no
