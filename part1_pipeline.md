@@ -15,7 +15,8 @@ without a corresponding line of output.
 
 | Layer | Unity Catalog location | Responsibility | Mutability |
 |---|---|---|---|
-| **Landing** | `/Volumes/workspace/deriv_assement/data/stream/…` | Raw vendor CSV and CDC JSONL land untouched. Never edited, never deleted. | Immutable |
+| **Landing** | `/Volumes/workspace/deriv_assement/data/batch/…`, `…/data/stream/…` | Raw vendor CSV, batch JSON and CDC JSONL land untouched. Never edited. Batch files are drained to the archive once captured; streaming files stay put under Auto Loader's checkpoint. | Immutable in content |
+| **Archive** | `/Volumes/workspace/deriv_assement/data/archive/{table}/{yyyyMMddHHmmss}/` | Batch files moved here after a successful Bronze write, in a folder stamped with the load's `delta_created_ts`. Replay source of record. | Write-once |
 | **Bronze** | `workspace.deriv_assement_bronze.*` | Append-only typed-as-string capture + lineage columns (`_source_file`, `delta_created_ts`, `row_hash`). No business rules. | Append-only |
 | **Silver** | `workspace.deriv_assement_silver.*` | Schema-drift normalisation, typing, DQ gate, deduplication, idempotent `MERGE` on the business key. CDC applied here into SCD2. | Merge target |
 | **Gold** | `workspace.deriv_assement_gold.*` | Kimball star: conformed dimensions + fact tables at declared grain. | Rebuildable |
@@ -34,12 +35,18 @@ flowchart TB
         V2["deposits_vendor_20240302.csv<br/>9 rows · column drift"]
         V3["deposits_vendor_20240303.csv<br/>6 rows · backdated 4d"]
         C1["client_profile_changes.jsonl<br/>12 events · arrival ≠ LSN order"]
+        BJ["batch/*.json<br/>signup · profile · deposit · trades"]
+    end
+
+    subgraph ARCH["Archive — UC Volume"]
+        ARC["archive/{table}/{load_ts}/<br/>consumed batch files"]
     end
 
     subgraph BRONZE["Bronze — append only"]
         B1["stream_client_deposits<br/>+ _source_file, row_hash"]
         B2["stream_client_profile_changes<br/>raw CDC preserved"]
         MAN["ingest_file_manifest<br/>file hash · event min/max · lag"]
+        BB["batch tables<br/>+ bronze_load_master watermark"]
     end
 
     subgraph SILVER["Silver — conformed"]
@@ -61,6 +68,9 @@ flowchart TB
     V1 & V2 & V3 --> B1
     C1 --> B2
     V1 & V2 & V3 -.hash + lag.-> MAN
+    BJ --> BB
+    BB -.files moved after commit.-> ARC
+    BB -.read at watermark.-> N
     B1 --> N --> DQ
     DQ -->|pass| S1
     DQ -->|fail| Q
@@ -84,11 +94,17 @@ interpret the operation, because an un-replayable Bronze layer is a dead end dur
 incident recovery. Silver sorts the batch by `lsn`, applies each event against
 `dim_client`, and records the outcome in `cdc_apply_log`.
 
+**Batch JSON path.** `spark.read.json` captures each landing folder into its Bronze table,
+then `bronze_load_master.latest_loaded_ts` is advanced and the consumed files are moved to
+the archive. Silver and Gold read these tables at that watermark rather than in full, so a
+re-run of the Bronze notebook cannot double-count. Mechanism (5) below covers the failure
+modes.
+
 ---
 
 ## 1a.2 Idempotency strategy
 
-Four independent mechanisms. Each one alone is insufficient; the combination means a
+Five independent mechanisms. Each one alone is insufficient; the combination means a
 re-run at any layer is a no-op.
 
 ### (1) File manifest with content hash — guards *ingestion*
@@ -136,6 +152,37 @@ all commit on 2024-11-15, and two of them (`1005` at 11:00, `1006` at 14:00) arr
 
 Facts are rebuilt with `replaceWhere` on the affected `date_key` range rather than
 appended, so a re-run of a date range replaces exactly that range.
+
+### (5) Master watermark + archive — guards *batch ingestion*
+
+The manifest in (1) covers the streaming path. The batch JSON path uses the control
+table instead, because Bronze is append-only and an unfiltered read of it returns every
+historical load stacked together.
+
+- **Write side.** `bronze_load_master` holds one row per Bronze table.
+  `latest_loaded_ts` is advanced only after the Bronze write commits, so a failed load
+  leaves the watermark pointing at the last good batch.
+- **Read side.** Silver and Gold read batch Bronze through a `read_bronze()` helper that
+  filters `delta_created_ts = latest_loaded_ts` for that table. Silver therefore always
+  sees exactly one batch, whatever Bronze has accumulated. A missing master row, or a
+  latest load that is not `SUCCESS`, is a BLOCK-severity abort rather than a silent empty
+  read — an empty read into a `MERGE` looks like a successful no-op, which is the worst
+  available failure mode.
+- **Drain side.** After the write and the watermark update both succeed, the consumed
+  files are moved to `archive/{table}/{yyyyMMddHHmmss}/`. The folder carries the same
+  timestamp as the watermark, so any Bronze row traces back to the exact file it came
+  from. An empty landing folder on the next run is reported as `NO_FILES`, not `FAILED`,
+  and does not advance the watermark.
+
+Archiving is deliberately the *last* step. Moving files before the commit would lose them
+on failure; moving them after means a crash mid-load leaves the landing folder intact to
+be re-driven. If an individual file fails to move, the load still succeeds and the file is
+re-ingested next run — the duplicate Bronze rows are inert, because the read side filters
+on the watermark.
+
+This mechanism is Databricks-only and is not exercised by the DuckDB prototype, which has
+no volume to archive into. It is implemented in `code/databricks/01_bronze_batch_json.py`
+and read back by `03`, `04` and `05`.
 
 **Verified overall:** all eight STATE tables report identical counts across two
 consecutive runs. `dq_result` and `reconciliation_result` are intentionally append-only —

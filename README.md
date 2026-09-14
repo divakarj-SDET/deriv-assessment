@@ -39,7 +39,7 @@ runnable local prototype in DuckDB so every claim can be verified without a clus
 │   └── 08_backfill_restatement.sql    Reload a date range without corrupting history
 ├── code/
 │   ├── databricks/
-│   │   ├── 01_bronze_batch_json.py            (existing) JSON → Bronze
+│   │   ├── 01_bronze_batch_json.py            (existing) JSON → Bronze, watermark + archive
 │   │   ├── 02_bronze_streaming_autoloader.py  (existing) Auto Loader → Bronze
 │   │   ├── 03_silver_vendor_deposits.py       DQ gate, dedupe, MERGE
 │   │   ├── 04_silver_cdc_scd2.py              LSN-ordered SCD2 with soft deletes
