@@ -123,7 +123,10 @@ checks = j.select(
                     F.lit("% of amount, expected ~1.00%"))).alias("w_fee_tolerance"),
     F.when(F.col("kyc_status") != "approved",
            F.concat(F.lit("kyc_status="), F.col("kyc_status"))).alias("w_kyc"),
-).cache()
+)
+# NOTE: no .cache() here — serverless compute rejects PERSIST/CACHE TABLE
+# ([NOT_SUPPORTED_WITH_SERVERLESS]). `checks` is re-derived by each downstream
+# action instead; the plan is cheap and serverless disk caching covers the scans.
 
 QUARANTINE_COLS = {"f_amount_positive": "amount_positive",
                    "f_client_exists": "client_exists",
