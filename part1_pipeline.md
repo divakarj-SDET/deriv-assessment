@@ -1,936 +1,415 @@
-# Part 1 --- Pipeline Design & Reconciliation
+# Part 1 — Pipeline Design & Reconciliation
 
-## 1. Purpose and Scope
+Platform: **Databricks on Unity Catalog**, Delta Lake, Auto Loader, Lakeflow Jobs.
+Everything below is implemented in `code/databricks/` and proven locally in
+`code/prototype/run_pipeline.py`, which runs end-to-end on the eight files in `data/`.
 
-This document describes the production-grade ingestion and
-reconciliation design for:
+Every number quoted in this document is emitted by that prototype. Nothing is asserted
+without a corresponding line of output.
 
-1.  The third-party vendor deposit CSV feed.
-2.  The `client_profile_changes.jsonl` CDC change-log.
+---
 
-The design is grounded in the assessment inputs, including duplicate
-vendor deposits, schema drift, late delivery, unknown clients, negative
-amounts, and CDC events arriving out of LSN order.
+## 1a.1 Architecture overview
 
-The target platform is a Databricks Lakehouse using Delta Lake and Unity
-Catalog.
+### Layers
 
-------------------------------------------------------------------------
+| Layer | Unity Catalog location | Responsibility | Mutability |
+|---|---|---|---|
+| **Landing** | `/Volumes/workspace/deriv_assement/data/stream/…` | Raw vendor CSV and CDC JSONL land untouched. Never edited, never deleted. | Immutable |
+| **Bronze** | `workspace.deriv_assement_bronze.*` | Append-only typed-as-string capture + lineage columns (`_source_file`, `delta_created_ts`, `row_hash`). No business rules. | Append-only |
+| **Silver** | `workspace.deriv_assement_silver.*` | Schema-drift normalisation, typing, DQ gate, deduplication, idempotent `MERGE` on the business key. CDC applied here into SCD2. | Merge target |
+| **Gold** | `workspace.deriv_assement_gold.*` | Kimball star: conformed dimensions + fact tables at declared grain. | Rebuildable |
+| **Control** | `workspace.deriv_assement_bronze.bronze_load_master` / `_history`, `ingest_file_manifest`, `cdc_apply_log`, `dq_result`, `quarantine_deposit`, `reconciliation_result` | Watermarks, file manifest, DQ evidence, recon breaks. | Mixed |
 
-# 2. Architecture Overview
+The Bronze layer and its control tables already exist in
+`code/databricks/01_bronze_batch_json.py` and `02_bronze_streaming_autoloader.py`.
+This document extends them forward.
 
-## 2.1 End-to-End Flow
+### Source-to-target flow
 
-``` mermaid
-flowchart LR
-    A[Vendor Deposit CSV] --> B[Landing / UC Volume]
-    C[CDC JSONL] --> D[Landing / UC Volume]
+```mermaid
+flowchart TB
+    subgraph LAND["Landing — UC Volume"]
+        V1["deposits_vendor_20240301.csv<br/>9 rows"]
+        V2["deposits_vendor_20240302.csv<br/>9 rows · column drift"]
+        V3["deposits_vendor_20240303.csv<br/>6 rows · backdated 4d"]
+        C1["client_profile_changes.jsonl<br/>12 events · arrival ≠ LSN order"]
+    end
 
-    B --> E[Auto Loader]
-    D --> F[Auto Loader]
+    subgraph BRONZE["Bronze — append only"]
+        B1["stream_client_deposits<br/>+ _source_file, row_hash"]
+        B2["stream_client_profile_changes<br/>raw CDC preserved"]
+        MAN["ingest_file_manifest<br/>file hash · event min/max · lag"]
+    end
 
-    E --> G[Bronze Vendor Deposits]
-    F --> H[Bronze CDC Events]
+    subgraph SILVER["Silver — conformed"]
+        N["Normalise aliases<br/>method → payment_method"]
+        DQ{"DQ gate<br/>BLOCK / QUARANTINE / WARN"}
+        Q["quarantine_deposit<br/>replayable"]
+        S1["silver_deposit<br/>MERGE on deposit_id"]
+        S2["dim_client SCD2<br/>apply by LSN order"]
+    end
 
-    G --> I[Silver Deposit Processing]
-    H --> J[Silver CDC / SCD2 Processing]
+    subgraph GOLD["Gold — star schema"]
+        F1["fact_deposit"]
+        F2["fact_trade"]
+        D1["dim_client · dim_date<br/>dim_instrument"]
+    end
 
-    I --> K[Reconciliation + DQ]
-    J --> K
+    R["reconciliation_result<br/>two-tier match"]
 
-    I --> L[Gold Facts / Dimensions]
-    J --> L
-
-    K --> M[Audit / Quarantine / Alerts]
-    L --> N[Analytics / BI / Risk / Compliance]
+    V1 & V2 & V3 --> B1
+    C1 --> B2
+    V1 & V2 & V3 -.hash + lag.-> MAN
+    B1 --> N --> DQ
+    DQ -->|pass| S1
+    DQ -->|fail| Q
+    Q -.re-driven on next run.-> DQ
+    B2 --> S2
+    S1 --> F1
+    S2 --> D1
+    S1 & B1 --> R
+    D1 --> F1 & F2
 ```
 
-## 2.2 Landing Layer
+### What happens at each hop
 
-The landing layer is the immutable file-arrival zone.
+**Vendor CSV path.** Auto Loader discovers new files incrementally and writes them to
+Bronze with `_metadata.file_path` lineage. Silver then maps declared column aliases,
+casts types, evaluates the DQ rule set, deduplicates on `deposit_id`, and `MERGE`s
+survivors into `silver_deposit`.
 
-Example locations:
+**CDC path.** The JSONL lands in Bronze verbatim — Bronze deliberately does **not**
+interpret the operation, because an un-replayable Bronze layer is a dead end during
+incident recovery. Silver sorts the batch by `lsn`, applies each event against
+`dim_client`, and records the outcome in `cdc_apply_log`.
 
-``` text
-/Volumes/workspace/deriv_assement/data/stream/
+---
+
+## 1a.2 Idempotency strategy
+
+Four independent mechanisms. Each one alone is insufficient; the combination means a
+re-run at any layer is a no-op.
+
+### (1) File manifest with content hash — guards *ingestion*
+
+Every file is registered in `ingest_file_manifest` by SHA-256 of its bytes.
+
+- **Same name, same hash** → skipped entirely. Verified: run the prototype twice and all
+  three files report `SKIPPED - byte-identical redelivery`.
+- **Same name, different hash** → treated as a *correction*. Bronze rows for that file are
+  deleted and re-ingested, and downstream `MERGE` self-heals. This is the case the
+  vendor will eventually hit when they resend a fixed file under the same name.
+
+Filename alone is not enough, because the vendor reuses names for corrections. Hash
+alone is not enough, because it cannot express "this file replaces that one".
+
+### (2) Deterministic business key + `MERGE` — guards *silver*
+
+`deposit_id` is the merge key. Re-processing the same logical row produces the same
+`row_hash`; the `MERGE` then matches and performs no write.
+
+```
+Run 1 → MERGE: 20 inserted, 0 updated,  0 unchanged
+Run 2 → MERGE:  0 inserted, 0 updated, 20 unchanged
 ```
 
-Files are not transformed at this stage.
+This also handles the *cross-file* duplicate. `VDEP002` and `VDEP005` appear in both
+`20240301.csv` and `20240302.csv` with identical payloads. Deduplication collapses
+**24 raw rows → 22 clean → 20 distinct** before the merge ever runs.
 
-The landing layer preserves the source payload and provides the basis
-for replay.
+### (3) LSN watermark — guards *CDC*
 
-For every file, operational metadata should be captured:
+`cdc_apply_log` records every `lsn` durably applied. On replay, events at or below the
+watermark are skipped:
 
--   source file name/path
--   file modification time
--   ingestion timestamp
--   source system
--   batch/run identifier
--   file size
--   optional file checksum/hash
-
-The important design principle is:
-
-> Landing preserves what arrived; downstream layers determine what is
-> trusted.
-
-------------------------------------------------------------------------
-
-# 3. Vendor CSV Pipeline
-
-## 3.1 Ingestion
-
-Vendor CSV files are discovered incrementally using Databricks Auto
-Loader.
-
-``` text
-Vendor CSV
-    |
-    v
-Landing Volume
-    |
-    v
-Auto Loader
-    |
-    v
-Bronze Delta
+```
+Run 1 → Applied 12 CDC events, skipped  0
+Run 2 → Applied  0 CDC events, skipped 12
 ```
 
-Auto Loader provides incremental file discovery and checkpoint-based
-progress tracking.
+A watermark on `commit_ts` would be wrong here: `lsn 1004`, `1005` and `1006` for `CL001`
+all commit on 2024-11-15, and two of them (`1005` at 11:00, `1006` at 14:00) arrive before
+`1004` (10:30). Only the LSN gives a total order.
 
-The vendor feed is file-based micro-batch ingestion, not true event
-streaming.
+### (4) Partition-scoped overwrite — guards *gold*
 
-The following files are explicitly part of the assessment:
+Facts are rebuilt with `replaceWhere` on the affected `date_key` range rather than
+appended, so a re-run of a date range replaces exactly that range.
 
-``` text
-deposits_vendor_20240301.csv
-deposits_vendor_20240302.csv
-deposits_vendor_20240303.csv
+**Verified overall:** all eight STATE tables report identical counts across two
+consecutive runs. `dq_result` and `reconciliation_result` are intentionally append-only —
+each run leaves its own evidence trail keyed by `run_id`.
+
+---
+
+## 1a.3 Late and missing data
+
+### The concrete problem in this dataset
+
+`deposits_vendor_20240303.csv` is labelled 3 March, but every row it contains is dated
+**24–28 February**. Its newest event is **4 days older than its own filename**.
+
+A pipeline that derives its processing window from the file label — the common default —
+would process "2024-03-03" and silently load **zero** of those 6 rows into the March
+partition, while February's totals stay permanently short. Nothing errors. The gap is
+found weeks later by Finance.
+
+### Detection
+
+Three signals, computed at ingest and stored in `ingest_file_manifest`:
+
+1. **Event-time vs label-time lag.** `lag_days = file_label_date - max(deposit_date)`.
+   The prototype flags `20240303.csv` as `LATE: newest event is 4d older than the file label`.
+2. **Arrival-window gap.** Expected daily cadence; a missing `deposits_vendor_YYYYMMDD.csv`
+   past its SLA raises a `MISSING_FILE` alert. No file is not the same as an empty file.
+3. **Sequence gap.** `deposit_id` is monotonic per vendor; a hole suggests an undelivered batch.
+
+### Self-reconciliation, without manual intervention
+
+The pipeline is **event-time driven, not file-time driven**. Two consequences:
+
+- **The processing window comes from the data.** The prototype derives the recon window
+  as `2024-02-24 .. 2024-03-02` from `min/max(deposit_date)` of the vendor rows, not from
+  the filename. The 6 backdated rows are inside the window and are reconciled.
+- **Affected partitions are recomputed, not appended to.** When a backdated row lands,
+  the pipeline collects the distinct `deposit_date` partitions it touches and re-runs the
+  Silver→Gold merge with `replaceWhere` over exactly those partitions. February's
+  aggregates are restated correctly; March is untouched.
+
+Combined with the idempotency guarantees, this makes late arrival a *normal* code path
+rather than an exception path. A file arriving 4 days late and a file arriving 40 days
+late take the same route.
+
+**Bounded restatement.** Partitions are re-opened for a rolling 90-day window. Beyond
+that, a backdated row is routed to quarantine and requires an explicit backfill run
+(see `part2_data_model.md` §2b.3) — otherwise a single ancient record could silently
+restate a closed financial period.
+
+---
+
+## 1a.4 Source-delete handling
+
+`lsn 1010` deletes `CL012` (David Tan, suspended, balance 0.00).
+
+**The warehouse never physically deletes.** A delete is applied as an end-dated SCD2 row
+plus a tombstone:
+
+1. The current version's `valid_to` is set to the delete's `commit_ts` (`2024-11-21 14:00:00`),
+   `is_current = FALSE`.
+2. A new version is inserted carrying the final known attribute values, with
+   `is_deleted = TRUE`, `is_current = TRUE`, `source_lsn = 1010`, `source_op = 'delete'`.
+
+Verified output:
+
+```
+CL012  status=suspended  1900-01-01 → 2024-11-21 14:00  current=False  deleted=False  lsn=0
+CL012  status=suspended  2024-11-21 14:00 → 9999-12-31  current=True   deleted=True   lsn=1010
 ```
 
-The second file introduces a schema change:
-
-``` text
-payment_method -> method
-```
-
-The third file is delivered late and contains records whose business
-dates precede the delivery date.
-
-------------------------------------------------------------------------
-
-## 3.2 Bronze Processing
-
-Bronze stores source-faithful records plus technical metadata.
-
-Typical metadata:
-
-``` text
-_source_file
-_source_file_modification_time
-_ingestion_ts
-batch_id
-```
-
-Bronze should avoid business transformations.
-
-Schema evolution is enabled for additive changes where appropriate,
-while source-specific fields are retained so the original payload can be
-reconstructed.
-
-Example:
-
-``` text
-Bronze
------
-deposit_id
-client_id
-deposit_date
-amount_usd
-payment_method / method
-currency_original
-exchange_rate
-status
-processing_days
-fee_usd
-_source_file
-_source_file_modification_time
-delta_created_ts
-delta_created_dt
-```
-
-Bronze ingestion metadata is deliberately not treated as part of the
-Silver business contract.
-
-------------------------------------------------------------------------
-
-# 4. Silver Vendor Deposit Processing
-
-Silver establishes the canonical business schema.
-
-Processing flow:
-
-``` text
-Bronze
-  |
-  +--> Normalize schema
-  |
-  +--> Validate mandatory fields
-  |
-  +--> Detect duplicates
-  |
-  +--> Validate business rules
-  |
-  +--> Validate client relationship
-  |
-  +--> Quarantine invalid records
-  |
-  +--> MERGE valid records
-  |
-  v
-Silver client_deposit
-```
-
-## 4.1 Schema Normalization
-
-The vendor schema drift is normalized:
-
-``` text
-payment_method -> payment_method
-method         -> payment_method
-```
-
-Therefore downstream consumers see one canonical column.
-
-------------------------------------------------------------------------
-
-# 5. Idempotency Strategy
-
-Idempotency is implemented at multiple levels because file-level
-exactly-once processing alone does not prevent business duplicates.
-
-## 5.1 File-Level Idempotency
-
-Auto Loader maintains checkpoint state for files already discovered and
-processed.
-
-A persistent checkpoint is used rather than an ephemeral checkpoint.
-
-Example:
-
-``` text
-/Volumes/workspace/deriv_assement/data/stream/
-_silver_checkpoints/client_deposits/
-```
-
-If the streaming job restarts, the checkpoint allows processing to
-resume without re-reading already committed input as new work.
-
-## 5.2 Business-Level Idempotency
-
-The Silver deposit table uses:
-
-``` text
-deposit_id
-```
-
-as the business key.
-
-Valid records are written using Delta `MERGE`:
-
-``` sql
-MERGE INTO silver.client_deposit t
-USING valid_deposits s
-ON t.deposit_id = s.deposit_id
-WHEN MATCHED THEN UPDATE SET ...
-WHEN NOT MATCHED THEN INSERT (...);
-```
-
-The final implementation intentionally uses explicit column mappings
-instead of `UPDATE ALL` / `INSERT ALL`.
-
-This prevents Bronze-only columns such as `_corrupt_record` or
-`_rescued_data` from becoming accidental Silver columns or causing MERGE
-failures.
-
-## 5.3 Deterministic Deduplication
-
-Duplicates within a batch are reduced before MERGE.
-
-Conceptually:
-
-``` text
-partition by deposit_id
-order by ingestion metadata descending
-```
-
-The deterministic winning record is retained.
-
-This is necessary because the assessment contains duplicate vendor
-records across files.
-
-------------------------------------------------------------------------
-
-# 6. Vendor Reconciliation
-
-The pipeline does not assume that the filename date equals the business
-date.
-
-Reconciliation uses business keys and business dates.
-
-For each vendor record:
-
-``` text
-vendor.deposit_id
-        |
-        v
-warehouse.deposit_id
-```
-
-The pipeline identifies:
-
--   vendor-only deposits
--   warehouse-only deposits
--   amount mismatches
--   client mismatches
--   status mismatches
--   duplicate vendor records
-
-A reconciliation result should contain:
-
-``` text
-reconciliation_date
-deposit_id
-vendor_present
-warehouse_present
-amount_match
-client_match
-status_match
-reconciliation_status
-severity
-```
-
-Recommended statuses:
-
-``` text
-MATCHED
-VENDOR_ONLY
-WAREHOUSE_ONLY
-FIELD_MISMATCH
-DUPLICATE_SOURCE
-INVALID_SOURCE
-```
-
-Critical reconciliation failures are retained in the
-audit/reconciliation layer and can trigger alerts.
-
-------------------------------------------------------------------------
-
-# 7. Late and Missing Data
-
-Late delivery and late-arriving business records are different concepts.
-
-## 7.1 Late File
-
-Example:
-
-``` text
-deposits_vendor_20240303.csv
-```
-
-arrives after the expected delivery window.
-
-The pipeline does not reject it.
-
-The file is processed when it arrives.
-
-## 7.2 Late Business Event
-
-A record can have:
-
-``` text
-deposit_date < delivery_date
-```
-
-This is not automatically an error.
-
-The pipeline separates:
-
-``` text
-business_date
-delivery/ingestion_date
-```
-
-Therefore historical deposits can be inserted or corrected based on
-`deposit_id`.
-
-## 7.3 Missing File Detection
-
-Expected vendor files should be tracked in a control table/manifest.
-
-Example:
-
-``` text
-expected_business_date
-expected_file_name
-arrival_ts
-processing_status
-record_count
-reconciliation_status
-```
-
-A scheduled reconciliation job evaluates the expected delivery calendar.
-
-Example:
-
-``` text
-Expected:
-2024-03-01 -> received
-2024-03-02 -> received
-2024-03-03 -> received late
-2024-03-04 -> missing
-```
-
-The missing date becomes:
-
-``` text
-MISSING
-```
-
-and remains eligible for subsequent reconciliation.
-
-## 7.4 Self-Reconciliation
-
-The pipeline periodically scans the landing/bronze layer for newly
-arrived files.
-
-When a missing file subsequently arrives:
-
-``` text
-MISSING
-   |
-   v
-file arrives
-   |
-   v
-Auto Loader discovers it
-   |
-   v
-Bronze
-   |
-   v
-Silver MERGE
-   |
-   v
-reconciliation status updated
-```
-
-No manual database correction is required.
-
-The combination of:
-
--   expected-file control table
--   Auto Loader discovery
--   business-key MERGE
--   source-vs-target reconciliation
-
-allows late data to self-heal.
-
-------------------------------------------------------------------------
-
-# 8. CDC Pipeline
-
-## 8.1 CDC Ingestion
-
-The CDC file contains:
-
-``` text
-lsn
-commit_ts
-op
-client_id
-before
-after
-```
-
-The source explicitly states that arrival order is not guaranteed to
-match LSN order.
-
-Therefore:
-
-> Arrival order must never be treated as source transaction order.
-
-Flow:
-
-``` text
-CDC JSONL
-    |
-    v
-Landing
-    |
-    v
-Auto Loader
-    |
-    v
-Bronze CDC
-    |
-    v
-Validate
-    |
-    v
-Order by LSN
-    |
-    v
-Replay check
-    |
-    v
-SCD2
-```
-
-------------------------------------------------------------------------
-
-# 9. CDC Idempotency and Ordering
-
-## 9.1 LSN as the Event Identity
-
-The CDC event is identified using:
-
-``` text
-lsn
-```
-
-A control table records successfully applied events:
-
-``` text
-silver.cdc_applied_events
-```
-
-Columns include:
-
-``` text
-lsn
-client_id
-op
-commit_ts
-applied_ts
-source_file
-```
-
-Before applying an event:
-
-``` text
-Is LSN already applied?
-       |
-   +---+---+
-   |       |
-  YES      NO
-   |       |
-  skip    validate
-           |
-           v
-         apply
-           |
-           v
-      record LSN
-```
-
-A replay therefore does not create another SCD2 version.
-
-## 9.2 Out-of-Order Events
-
-CDC events are sorted by LSN before applying them.
-
-Example:
-
-``` text
-Arrival:
-100
-102
-101
-```
-
-Processing:
-
-``` text
-100
-101
-102
-```
-
-For an affected client, an event with an LSN less than or equal to the
-currently applied LSN is treated as stale/out-of-order and quarantined
-for investigation rather than silently overwriting newer state.
-
-This protects the historical timeline.
-
-------------------------------------------------------------------------
-
-# 10. Source Delete Handling
-
-Hard deletes are not performed in the warehouse.
-
-For:
-
-``` text
-op = DELETE
-```
-
-the current SCD2 record is end-dated:
-
-``` text
-effective_to = delete.commit_ts
-is_current = false
-```
-
-A new soft-delete version is inserted:
-
-``` text
-is_current = true
-is_deleted = true
-account_status = deleted
-```
-
-The CDC event is also retained in the audit/control layer.
-
-Result:
-
-``` text
-Client CL001
-
-Version 1
-effective_from = 2024-01-01
-effective_to   = 2024-11-30
-is_current     = false
-is_deleted     = false
-
-Version 2
-effective_from = 2024-11-30
-effective_to   = high_date
-is_current     = true
-is_deleted     = true
-```
-
-## Trade-offs
-
-### Advantages
-
--   Complete historical auditability.
--   No loss of regulatory history.
--   Historical reports remain reproducible.
--   Current consumers can easily filter `is_deleted = false`.
+The row remains joinable, so `DEP008` and `VDEP004` — two real deposits by `CL012` —
+still resolve to a dimension member. A hard delete would orphan them and silently change
+historical revenue.
 
 ### Trade-offs
 
--   Additional storage.
--   Queries must understand current vs historical rows.
--   Downstream consumers must explicitly exclude deleted current records
-    where appropriate.
+| | |
+|---|---|
+| **For** | History and audit trail intact; prior-period reports remain reproducible; facts never orphan; supports "what did we know on date X". |
+| **Against** | The dimension grows monotonically; every consumer must filter `is_deleted = FALSE` or they will double-count. Storage and join cost rise. |
+| **Mitigation** | Consumers read a `v_dim_client_current` view with the filter applied — the raw table is reserved for audit and point-in-time queries. |
+| **The real tension** | A GDPR erasure request cannot be satisfied by a soft delete. That is handled separately: crypto-shredding of PII columns (`full_name`, `date_of_birth`, `email`) while the surrogate key, the SCD2 timeline and all financial facts survive. Erasing a client must not erase the money. |
 
-For a financial trading platform, preserving history is preferred over
-physical deletion.
+A delete is also not always a delete. Debezium-style feeds emit deletes on re-keying
+operations. Because we retain the tombstone rather than destroying the row, a
+subsequent re-insert of `CL012` reopens the timeline correctly instead of losing it.
 
-------------------------------------------------------------------------
+---
 
-# 11. Data Quality and Edge Cases
+## 1a.5 Edge cases explicitly handled
 
-The design explicitly handles the following assessment-specific cases.
+Five cases, each traceable to a specific record in `data/`.
 
-  -----------------------------------------------------------------------
-  Edge case               Severity                Handling
-  ----------------------- ----------------------- -----------------------
-  Duplicate vendor        Medium                  Deterministic
-  deposit ID                                      deduplication by
-                                                  `deposit_id`; audit
-                                                  duplicate
+### EC-1 — Schema drift: a renamed column mid-feed
 
-  `payment_method`        Medium                  Canonical schema
-  renamed to `method`                             mapping to
-                                                  `payment_method`
+**Where:** `deposits_vendor_20240302.csv` renames `payment_method` → `method`.
 
-  Late vendor file        Medium                  Accept late arrival;
-                                                  process by business
-                                                  key; reconcile
-                                                  expected-file manifest
+**Why it matters:** with schema inference, day 2 silently produces a **new** `method`
+column and a **null** `payment_method` for 9 rows. Every `GROUP BY payment_method`
+report develops a null bucket, and nothing fails.
 
-  Unknown client such as  High                    Quarantine deposit;
-  `CL099`                                         reconcile after client
-                                                  becomes available
+**Handling:** a declared alias map (`method → payment_method`), applied at Silver. Aliases
+are *declared, never inferred* — an unmapped column is a `BLOCK`-severity failure that
+aborts the batch rather than being dropped. Bronze keeps the original header verbatim for
+audit. Verified: `DRIFT ['method'] mapped to canonical names`.
 
-  Negative deposit amount High                    Quarantine; do not
-                                                  publish to trusted
-                                                  Silver
+The same class of defect exists in the warehouse feed: `DEP012` carries
+`"credit_card": "credit_card"` where `payment_method` should be. The value is recovered
+from the malformed key and a `WARN` is raised against the source system, rather than
+loading a null. Verified: `RECOVERED DEP012: payment_method from malformed key 'credit_card'`.
 
-  Out-of-order CDC LSN    High                    Process by LSN; stale
-                                                  events quarantined
+### EC-2 — Backdated file: events older than the delivery label
 
-  Duplicate/replayed CDC  Medium                  Skip using
-  LSN                                             `cdc_applied_events`
+**Where:** `deposits_vendor_20240303.csv`, 6 rows dated 2024-02-24 to 2024-02-28.
 
-  CDC DELETE              Critical/business event End-date current row
-                                                  and create soft-delete
-                                                  version; retain audit
-  -----------------------------------------------------------------------
+**Handling:** event-time windowing plus partition restatement, as described in §1a.3.
+Detected automatically via the `lag_days` signal in the manifest.
 
-The assessment requires 2--5 named edge cases; the design deliberately
-provides more than the minimum because they are directly present in the
-supplied data.
+### EC-3 — Cross-file duplicate redelivery
 
-------------------------------------------------------------------------
+**Where:** `VDEP002` and `VDEP005` appear in both the 0301 and 0302 files, byte-identical.
 
-# 12. Quarantine Strategy
+**Why it matters:** naive appends inflate deposit volume by 2 rows / $2,375 and
+double-count those clients' funding.
 
-Invalid records are not silently dropped.
+**Handling:** deduplication on `deposit_id` with last-file-wins precedence, then a
+hash-guarded `MERGE`. Redelivery of an *identical* row is a no-op; redelivery of a
+*corrected* row updates in place. Verified: `Deduplicated 22 → 20 (2 cross-file duplicates collapsed)`.
 
-Separate quarantine tables are maintained, for example:
+### EC-4 — Orphan foreign key: a deposit for a client that does not exist
 
-``` text
-silver.quarantine_deposits
-silver.quarantine_profile_cdc
+**Where:** `VDEP020` references `CL099`; `DEP020` references `CL031`. Neither exists in
+`client_signup.json` (which ends at `CL030`).
+
+**Why it matters:** an inner join silently drops the row and understates deposits; an
+outer join produces a fact with a null dimension key.
+
+**Handling:** severity-differentiated. The row is **quarantined, not discarded**, and
+re-driven on every subsequent run. If the dimension row arrives later, the deposit flows
+through automatically with no manual replay — this is the late-arriving-dimension case
+from Part 2a viewed from the ingestion side. If it never arrives, the row stays in
+`quarantine_deposit` with an ageing alert, and is bound to an inferred dimension member
+so gold totals stay complete. Verified: 2 quarantined rows (`VDEP020`, `DEP020`).
+
+### EC-5 — Out-of-order CDC with multiple same-day changes to one key
+
+**Where:** `client_profile_changes.jsonl` arrives as
+`[1005, 1009, 1001, 1004, 1010, 1012, 1003, 1015, 1008, 1018, 1006, 1020]`.
+`CL001` has three changes (`1004`, `1005`, `1006`) all committed on 2024-11-15, delivered
+in the order 1005 → 1004 → 1006.
+
+**Why it matters:** applied in arrival order, `CL001`'s final state becomes
+`risk=high, balance=1250, status=under_review` — the balance update at `lsn 1005` is
+overwritten by the *earlier* `lsn 1004` image. The client's balance is wrong by $600 and
+the SCD2 timeline is non-monotonic.
+
+**Handling:** the batch is sorted by `lsn` before application, and per-key changes are
+applied sequentially so each version's `valid_from` equals the previous version's
+`valid_to`. Verified — a contiguous, correctly ordered timeline:
+
+```
+medium 1250.00 active        1900-01-01        → 2024-11-15 10:30   lsn=0
+high   1250.00 active        2024-11-15 10:30  → 2024-11-15 11:00   lsn=1004
+high   1850.00 active        2024-11-15 11:00  → 2024-11-15 14:00   lsn=1005
+high   1850.00 under_review  2024-11-15 14:00  → 9999-12-31         lsn=1006 (current)
 ```
 
-A quarantine record should contain:
+Two related sub-cases fall out of the same mechanism:
 
-``` text
-quarantine_id
-source_file
-business_key
-reason
-severity
-raw/derived payload
-detected_ts
-processing_batch_id
+- **Partial after-images.** `after` carries only `risk_category`, `account_balance_usd`
+  and `account_status`. Unchanged attributes (`full_name`, `nationality`, …) are carried
+  forward from the prior version rather than nulled.
+- **Insert for an existing key.** `lsn 1001` inserts `CL030`, who already exists in
+  `client_profile.json` with identical tracked attributes. Treated as an upsert and
+  hash-compared: no new version is created. Verified:
+  `lsn 1001 INSERT CL030: tracked attributes unchanged -> no new version`.
+
+---
+
+## Data quality safeguards (optional deliverable)
+
+Severity drives a **distinct** action per rule. Nothing is "log and continue".
+
+| Severity | Action on failure | Batch outcome |
+|---|---|---|
+| **BLOCK** | Abort the batch before any Silver write; page on-call. | Nothing lands. Partial loads are worse than no load. |
+| **QUARANTINE** | Withhold the row; write it to `quarantine_deposit`; re-drive automatically next run. | Batch completes; row is recoverable without replay. |
+| **WARN** | Load the row; record evidence in `dq_result` for stewardship. | Batch completes; analysts see the flag. |
+
+### Rule register
+
+| Rule | Severity | On failure | Fires on this data |
+|---|---|---|---|
+| `deposit_id_not_null` | BLOCK | Abort, page on-call | — |
+| `unknown_column_in_file` | BLOCK | Abort, alert vendor ops | — (aliases cover `method`) |
+| `amount_positive` | QUARANTINE | Withhold, vendor ticket | `VDEP001` = **-250.00** |
+| `client_exists` | QUARANTINE | Withhold, park for late dimension | `VDEP020`→`CL099`, `DEP020`→`CL031` |
+| `payment_method_present` | QUARANTINE | Withhold, vendor ticket | — (recovered for `DEP012`) |
+| `deposit_not_before_signup` | WARN | Load, flag stewardship | **14 rows**, e.g. `VDEP019` (`CL022`, deposit 2024-02-25, signup 2024-04-20) |
+| `fee_within_tolerance` | WARN | Load, flag finance | `VDEP012` fee 1.60%, `VDEP021` 1.43% vs 1.00% norm |
+| `kyc_approved_for_deposit` | WARN | Load, flag to compliance | `VDEP004` (`CL012` = **rejected**), `VDEP009` (`CL026` = **pending**) |
+| `pnl_recomputes` | WARN | Load both values, flag trading ops | `TRD012`: reported **245.00**, derived **0.00** (open = close = 2320.00) |
+| `malformed_key_recovered` | WARN | Load recovered value, raise source fix | `DEP012` |
+
+Run totals: **24 rows in → 22 clean → 20 loaded**, 3 quarantined (incl. warehouse feed),
+21 warnings.
+
+### Two judgement calls worth defending
+
+**Negative amount is quarantine, not block.** `VDEP001` at -250.00 is most likely a
+refund or chargeback the vendor encoded in the same feed. Blocking the batch for it would
+halt 23 good rows. Quarantine preserves it for a decision without stopping the pipeline.
+If refunds turn out to be legitimate traffic, the correct fix is a `transaction_type`
+column in the contract — not a relaxed rule.
+
+**`deposit_not_before_signup` is WARN, not QUARANTINE, despite firing on 14 of 24 rows.**
+A rule that fails 58% of a feed is describing the business, not catching a defect: the
+vendor's `client_id` namespace evidently does not align with warehouse signup dates.
+Quarantining 14 rows would destroy the feed's usefulness and train the team to ignore the
+queue. It is flagged loudly and escalated to a contract question with the vendor. This is
+the distinction between a rule that protects data and a rule that merely generates noise.
+
+**Not modelled as failures:** `CL025`'s date of birth of **1888-12-19** (age 136) and
+`CL026`'s null `last_login_date` are profile-domain issues, handled by the dimension's own
+rule set rather than the deposit gate — `CL025` is flagged for KYC re-verification;
+`CL026`'s null is legitimate (the client has never logged in) and is modelled as a known
+null, not an error.
+
+---
+
+## 1b. Reconciliation: vendor feed vs `client_deposit`
+
+### Design
+
+Reconciliation is **two-tier**, because a single matching strategy is fragile:
+
+- **Tier 1 — `deposit_id`.** Exact identifier match. Cheap and unambiguous.
+- **Tier 2 — composite business key.** `client_id + deposit_date + amount_usd` (±0.01).
+  Catches genuine economic matches where identifiers differ between systems.
+
+Anything unmatched is classified as `IN_VENDOR_NOT_IN_WAREHOUSE` or
+`IN_WAREHOUSE_NOT_IN_VENDOR` and written to `reconciliation_result` with a variance amount.
+
+### Result on this data — and what it actually means
+
+```
+Recon window (from event dates): 2024-02-24 .. 2024-03-02
+Tier 1 (deposit_id)                        : 0 matches
+Tier 2 (client_id + date + amount)         : 0 matches
+Breaks: 20 vendor-only, 1 warehouse-only (in window)
+Vendor control total: 20 rows, $28,525.00
 ```
 
-This provides a recoverable path:
+Zero matches at both tiers is the headline finding, and it is **not** a pipeline failure.
+The two feeds do not share an identifier namespace — vendor IDs are `VDEP001…VDEP022`,
+warehouse IDs are `DEP001…DEP020`, with **no overlap** — and Tier 2 confirms no economic
+duplicates either. The one warehouse-only row in the window is `DEP008`
+(`CL012`, 2024-02-25, $350.00).
 
-``` text
-Invalid
-   |
-   v
-Quarantine
-   |
-   +--> investigation
-   |
-   +--> source correction
-   |
-   +--> replay
-   |
-   v
-Silver
-```
+The correct conclusion: **this vendor feed is net-new deposit traffic, not a mirror of
+`client_deposit`.** So reconciliation here is a *completeness and control-total* check,
+not a row-for-row tie-out. Reporting "100% break rate" to the business would be
+technically true and completely misleading.
 
-------------------------------------------------------------------------
+Had I assumed a tie-out and built only Tier 1, I would have raised 22 false breaks on day
+one. The two-tier design is what makes the distinction visible.
 
-# 13. DQ Severity Model
+### Operational reconciliation controls
 
-The pipeline distinguishes failures by business impact.
-
-  Rule                      Severity                  Action
-  ------------------------- ------------------------- -----------------------------------
-  Missing deposit ID        Critical                  Quarantine
-  Missing client ID         Critical                  Quarantine
-  Negative deposit amount   High                      Quarantine
-  Unknown client            High                      Quarantine + later reconciliation
-  Duplicate deposit ID      Medium                    Deduplicate + audit
-  Schema rename             Medium                    Normalize
-  Duplicate CDC LSN         Medium                    Ignore replay + audit
-  Stale CDC LSN             High                      Quarantine
-  CDC delete                Critical/business event   Soft delete + audit
-
-Critical failures affecting the trusted target should not be silently
-published.
-
-------------------------------------------------------------------------
-
-# 14. Operational Monitoring
-
-The pipeline maintains operational metadata including:
-
-``` text
-process_name
-batch_id
-process_start_ts
-process_end_ts
-records_received
-records_processed
-records_quarantined
-duplicate_count
-status
-error_message
-```
-
-Monitoring should expose:
-
--   ingestion freshness
--   expected vs received files
--   record counts
--   duplicate counts
--   quarantine counts
--   reconciliation mismatches
--   CDC lag
--   processing failures
--   schema changes
-
-Alerts should be triggered for critical failures and SLA breaches.
-
-------------------------------------------------------------------------
-
-# 15. Recovery and Replay
-
-Recovery follows a layered approach.
-
-## File replay
-
-If a file must be replayed:
-
-``` text
-Landing
-  |
-  v
-Bronze
-  |
-  v
-Silver MERGE
-```
-
-The business key prevents duplicate target records.
-
-## CDC replay
-
-If a CDC file is replayed:
-
-``` text
-LSN
- |
- v
-cdc_applied_events
- |
- +--> already applied -> skip
- |
- +--> not applied -> process
-```
-
-## Failed micro-batch
-
-Streaming checkpoints allow the query to resume from its last committed
-progress.
-
-Quarantined records remain available for controlled remediation and
-replay.
-
-------------------------------------------------------------------------
-
-# 16. Reconciliation Control Flow
-
-``` mermaid
-flowchart TD
-    A[Expected File Calendar] --> B{File Received?}
-    B -->|No| C[Mark Missing]
-    C --> D[Continue Monitoring]
-    D --> B
-
-    B -->|Yes| E[Bronze]
-    E --> F[Silver Validation]
-    F --> G[Business Key MERGE]
-    G --> H[Source vs Warehouse Reconciliation]
-
-    H --> I{Match?}
-    I -->|Yes| J[MATCHED]
-    I -->|No| K[MISMATCH / QUARANTINE]
-    K --> L[Audit + Alert]
-```
-
-------------------------------------------------------------------------
-
-# 17. Target State
-
-The final architecture separates responsibilities:
-
-``` text
-LANDING
-  Preserve source files
-       |
-       v
-BRONZE
-  Source-faithful data
-  + ingestion metadata
-       |
-       v
-SILVER
-  Canonical schema
-  + validation
-  + deduplication
-  + referential integrity
-  + quarantine
-  + CDC SCD2
-  + idempotent MERGE
-       |
-       v
-RECONCILIATION
-  Source vs target controls
-  + missing/late file detection
-  + DQ metrics
-       |
-       v
-GOLD
-  Trusted dimensional/business data
-```
-
-The key principle is:
-
-> **Bronze preserves what the source sent; Silver decides what the
-> platform can trust; reconciliation proves that the trusted data
-> remains complete and consistent.**
-
-------------------------------------------------------------------------
-
-# 18. Implementation References
-
-The accompanying prototype implements the described Bronze/Silver
-processing in Databricks.
-
-Important implementation decisions include:
-
--   Auto Loader for incremental file discovery.
--   Unity Catalog Volume paths for landing/checkpoints.
--   `_metadata.file_path` for source-file metadata in Unity Catalog
-    environments.
--   Delta MERGE for business-key idempotency.
--   Explicit Silver MERGE mappings to prevent Bronze-only schema fields
-    from breaking the target contract.
--   `foreachBatch` for file-based vendor-to-Silver processing.
--   CDC LSN tracking through `cdc_applied_events`.
--   SCD2 history with soft-delete handling.
--   Audit and quarantine tables.
-
-For the assessment-sized CDC dataset, sequential LSN application is
-acceptable as a prototype. A high-volume production implementation
-should use scalable stateful/event-time processing rather than
-collecting an entire micro-batch to the driver.
-
-------------------------------------------------------------------------
-
-# 19. Part 1 Completion Checklist
-
-  Requirement                        Status
-  ---------------------------------- ----------
-  Architecture overview              Complete
-  Vendor CSV source-to-target flow   Complete
-  CDC source-to-target flow          Complete
-  Idempotency mechanism              Complete
-  File/checkpoint strategy           Complete
-  Business-key MERGE strategy        Complete
-  Late data handling                 Complete
-  Missing file detection             Complete
-  Self-reconciliation                Complete
-  Source-delete handling             Complete
-  Delete trade-offs                  Complete
-  2--5 explicit edge cases           Complete
-  Data-quality severity/actions      Complete
-  Recovery/replay strategy           Complete
-  Operational monitoring             Complete
-
-**Part 1a is therefore complete and submission-ready.**
+| Control | Rule |
+|---|---|
+| Control totals | Row count and `sum(amount_usd)` per `deposit_date` per source, compared daily. |
+| Break ageing | Unresolved breaks tracked by age; > 3 days escalates to the vendor. |
+| Tolerance | ±0.01 USD absorbs float noise; anything larger is a real variance. |
+| Materiality | Breaks > $10,000 page immediately regardless of age — `DEP013` at $75,000 is a single row that moves a weekly number. |
+| Evidence | Every run appends to `reconciliation_result` keyed by `run_id`; history is never overwritten. |

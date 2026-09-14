@@ -1,958 +1,431 @@
-# Part 2 --- Dimensional Data Model
+# Part 2 — Data Model & Historization
 
-## 1. Objective
+SQL for everything below is in `sql/`. The model is implemented in
+`code/databricks/05_gold_dimensional.py` and exercised by the prototype.
 
-The objective of Part 2 is to define a production-grade dimensional
-model for the trading platform that supports:
+---
 
--   client-level analytics
--   deposit and trading analytics
--   historical reporting
--   SCD Type 2 client-profile history
--   source updates and deletes without physically deleting analytical
-    history
--   late-arriving dimensions
--   historical reloads without corrupting previously established history
+## 2a. Dimensional model
 
-The model follows a Kimball-style star-schema approach while keeping the
-detailed SCD2 history in a dedicated client-profile dimension.
+### Choice: Kimball star schema, with one Data Vault borrowing
 
-------------------------------------------------------------------------
+**Kimball**, for reasons specific to this dataset rather than by default:
 
-## 2. Modeling Principles
+1. **The business questions are additive and well-bounded.** Deposit volume by country,
+   PnL by instrument, funnel by referral source. These are `SUM(measure) BY dimension` —
+   exactly what a star is optimised for.
+2. **The source topology is already a star.** `client_signup` is the root entity;
+   `client_deposit` and `client_trades` are many:1 against it; `client_profile` is 1:1.
+   That maps to one conformed client dimension and two facts with almost no reshaping.
+3. **Data Vault would be over-engineering here.** Its payoff is many source systems with
+   competing definitions of the same entity and high schema churn. We have two sources
+   (warehouse + one vendor) and one business key, `client_id`. Vault would add hub/link/
+   satellite hops and a mandatory presentation layer on top — roughly triple the objects
+   for no analytical gain, and slower C-suite queries.
+4. **Delta Lake covers Vault's auditability advantage.** Time travel, `DESCRIBE HISTORY`,
+   and the append-only Bronze layer already give full lineage and replay.
 
-### 2.1 Facts represent business events
+**The borrowing:** deposits arrive from two systems that do not share an identifier
+namespace (Part 1b). So `fact_deposit` carries an explicit **`source_system`** column and
+a surrogate key derived from `source_system + natural_id`. That is Vault-style
+multi-source tracking on a Kimball grain — it prevents a future third processor from
+colliding with `DEP*` or `VDEP*` IDs.
 
-The fact tables represent measurable business events at a clearly
-defined grain.
+**When I would revisit this:** if a second and third payment processor onboard, each with
+its own client identifier requiring a mastering step, the same-as-link concept starts
+earning its cost. One vendor does not justify it.
 
-  Fact             Grain
-  ---------------- ------------------------------
-  `fact_deposit`   One row per accepted deposit
-  `fact_trade`     One row per accepted trade
+### ERD
 
-A deposit or trade must not be duplicated because of joins to
-dimensions.
-
-### 2.2 Dimensions describe business entities
-
-Dimensions contain descriptive attributes used to slice and analyze
-facts.
-
-Core dimensions:
-
--   `dim_client`
--   `dim_client_profile_scd2`
--   `dim_date`
--   `dim_instrument`
--   `dim_payment_method`
-
-### 2.3 Surrogate keys
-
-Facts use surrogate dimension keys rather than relying exclusively on
-source identifiers.
-
-Example:
-
-``` text
-client_id = source/business key
-client_sk = warehouse surrogate key
-```
-
-This is important because a client can have multiple historical profile
-versions while retaining the same business `client_id`.
-
-------------------------------------------------------------------------
-
-# 3. Star Schema
-
-``` mermaid
+```mermaid
 erDiagram
+    DIM_CLIENT   ||--o{ FACT_DEPOSIT : "client_sk"
+    DIM_CLIENT   ||--o{ FACT_TRADE   : "client_sk"
+    DIM_DATE     ||--o{ FACT_DEPOSIT : "date_key"
+    DIM_DATE     ||--o{ FACT_TRADE   : "date_key"
+    DIM_INSTRUMENT ||--o{ FACT_TRADE : "instrument_key"
+    DIM_PAYMENT_METHOD ||--o{ FACT_DEPOSIT : "payment_method_key"
+    DIM_CLIENT   ||--o{ FACT_CLIENT_BALANCE_SNAPSHOT : "client_sk"
 
     DIM_CLIENT {
-        BIGINT client_sk PK
-        STRING client_id NK
-        STRING signup_channel
-        STRING country
-        DATE signup_date
-        BOOLEAN is_current
-        TIMESTAMP created_ts
-        TIMESTAMP updated_ts
-    }
-
-    DIM_CLIENT_PROFILE_SCD2 {
-        BIGINT client_profile_sk PK
-        STRING client_id FK
-        STRING account_status
-        STRING risk_level
-        STRING profile_segment
-        STRING email
-        STRING phone
-        TIMESTAMP effective_from_ts
-        TIMESTAMP effective_to_ts
-        BOOLEAN is_current
-        BOOLEAN is_deleted
-        BIGINT source_lsn
-        TIMESTAMP created_ts
-        TIMESTAMP updated_ts
-    }
-
-    DIM_DATE {
-        INT date_sk PK
-        DATE calendar_date
-        INT calendar_year
-        INT quarter_num
-        INT month_num
-        STRING month_name
-        INT week_num
-        STRING day_name
-        BOOLEAN is_weekend
-    }
-
-    DIM_INSTRUMENT {
-        BIGINT instrument_sk PK
-        STRING instrument_id NK
-        STRING instrument_name
-        STRING instrument_type
-        STRING base_currency
-        STRING quote_currency
-        BOOLEAN is_active
-    }
-
-    DIM_PAYMENT_METHOD {
-        BIGINT payment_method_sk PK
-        STRING payment_method_code NK
-        STRING payment_method_name
-        STRING provider
-        BOOLEAN is_active
+        string  client_sk PK "hash(client_id, valid_from)"
+        string  client_id  "business key"
+        string  full_name
+        date    date_of_birth
+        string  country
+        string  nationality
+        string  account_type
+        string  kyc_status
+        string  referral_source
+        string  risk_category  "SCD2 tracked"
+        decimal account_balance_usd "SCD2 tracked"
+        string  account_status "SCD2 tracked"
+        date    signup_date
+        ts      valid_from
+        ts      valid_to
+        boolean is_current
+        boolean is_deleted "soft delete"
+        boolean is_inferred "late-arriving stub"
+        bigint  source_lsn
     }
 
     FACT_DEPOSIT {
-        BIGINT deposit_sk PK
-        STRING deposit_id NK
-        BIGINT client_sk FK
-        BIGINT profile_sk FK
-        INT deposit_date_sk FK
-        BIGINT payment_method_sk FK
-        DECIMAL amount_usd
-        DECIMAL amount_original
-        DECIMAL exchange_rate
-        DECIMAL fee_usd
-        STRING currency_original
-        STRING status
-        INT processing_days
-        TIMESTAMP transaction_ts
-        TIMESTAMP loaded_ts
+        string  deposit_sk PK
+        string  deposit_id "natural key"
+        string  client_sk FK
+        string  client_id  "degenerate, for as-is joins"
+        int     date_key FK
+        string  payment_method_key FK
+        string  source_system "WAREHOUSE | VENDOR"
+        decimal amount_usd
+        decimal fee_usd
+        decimal net_amount_usd
+        int     processing_days
+        string  status
     }
 
     FACT_TRADE {
-        BIGINT trade_sk PK
-        STRING trade_id NK
-        BIGINT client_sk FK
-        BIGINT profile_sk FK
-        BIGINT instrument_sk FK
-        INT trade_date_sk FK
-        DECIMAL quantity
-        DECIMAL price
-        DECIMAL notional_usd
-        DECIMAL fee_usd
-        STRING side
-        STRING status
-        TIMESTAMP trade_ts
-        TIMESTAMP loaded_ts
+        string  trade_sk PK
+        string  trade_id
+        string  client_sk FK
+        int     date_key FK
+        string  instrument_key FK
+        string  direction
+        decimal volume_lots
+        decimal open_price
+        decimal close_price
+        decimal pnl_usd_reported
+        decimal pnl_usd_derived "recomputed"
+        decimal pnl_variance_usd "control"
+        string  trade_status
     }
 
-    DIM_CLIENT ||--o{ FACT_DEPOSIT : "client_sk"
-    DIM_CLIENT_PROFILE_SCD2 ||--o{ FACT_DEPOSIT : "profile_sk"
-    DIM_DATE ||--o{ FACT_DEPOSIT : "deposit_date_sk"
-    DIM_PAYMENT_METHOD ||--o{ FACT_DEPOSIT : "payment_method_sk"
-
-    DIM_CLIENT ||--o{ FACT_TRADE : "client_sk"
-    DIM_CLIENT_PROFILE_SCD2 ||--o{ FACT_TRADE : "profile_sk"
-    DIM_INSTRUMENT ||--o{ FACT_TRADE : "instrument_sk"
-    DIM_DATE ||--o{ FACT_TRADE : "trade_date_sk"
+    FACT_CLIENT_BALANCE_SNAPSHOT {
+        int     date_key PK
+        string  client_sk PK
+        decimal account_balance_usd
+        string  risk_category
+        string  account_status
+    }
 ```
 
-------------------------------------------------------------------------
+### Tables and grain
 
-# 4. Dimension Design
+| Table | Type | Grain — stated explicitly | Notes |
+|---|---|---|---|
+| `dim_client` | SCD2 dimension | **One row per client per version of its tracked attributes** | Merges `client_signup` (1:1) and `client_profile` (1:1). Keeping them separate would force every query into a two-dimension join for no benefit. |
+| `dim_date` | Conformed | One row per calendar date | Shared by both facts. |
+| `dim_instrument` | SCD1 | One row per instrument | Carries `asset_class` (FX / metals / crypto / index) and `contract_size` — the latter is what makes the `TRD012` PnL check possible. |
+| `dim_payment_method` | SCD1 | One row per payment method | Low cardinality; history not valuable. |
+| `fact_deposit` | Transaction fact | **One row per deposit event per source system** | Additive: `amount_usd`, `fee_usd`, `net_amount_usd`. |
+| `fact_trade` | Transaction fact | **One row per trade** | Additive: `pnl_usd`. Semi-additive: `volume_lots`. Non-additive: prices — never `SUM` them. |
+| `fact_client_balance_snapshot` | Periodic snapshot | **One row per client per day** | Why it exists below. |
 
-## 4.1 `dim_client`
+### Why `account_balance_usd` lives in two places
 
-### Grain
+It is an SCD2 attribute on `dim_client` *and* a measure on a daily snapshot fact. That is
+deliberate, not redundancy:
 
-One row per logical client.
+- The SCD2 column answers *"what was this client's balance at 14:00 on 15 Nov?"* — exact,
+  event-driven, irregular.
+- The snapshot fact answers *"what was total AUM by country each day?"* — a question that
+  is painful against SCD2 (you must range-join every client's version interval against a
+  date spine) and trivial against a daily grain.
 
-### Purpose
+The snapshot is derived *from* the SCD2 dimension, so there is one source of truth and no
+drift.
 
-Contains relatively stable client-level attributes originating from
-signup and other master-data sources.
+### One modelling trap in this data
 
-Recommended columns:
+`account_balance_usd` is named USD, but 13 of 30 clients carry a non-USD `currency`
+(`CL003` THB, `CL004` IDR, `CL009` EUR, `CL020` EUR, `CL010` BRL, …). Either the column is
+misnamed or the values are unconverted. Summing it across clients today produces a
+meaningless number that looks plausible.
 
-  Column             Type        Purpose
-  ------------------ ----------- ---------------------------------
-  `client_sk`        BIGINT      Surrogate key
-  `client_id`        STRING      Source/business key
-  `signup_channel`   STRING      Acquisition/signup channel
-  `country`          STRING      Client country
-  `signup_date`      DATE        Signup date
-  `is_current`       BOOLEAN     Current master record
-  `created_ts`       TIMESTAMP   Warehouse creation timestamp
-  `updated_ts`       TIMESTAMP   Last warehouse update timestamp
+The model forces the ambiguity into the open: `account_balance_original`,
+`currency`, `fx_rate_to_usd`, and a derived `account_balance_usd` that is *computed*, not
+trusted. Until the source confirms the semantics, the derived column is the only one
+exposed to reporting.
 
-`client_id` remains the stable natural/business key.
+### Late-arriving dimension records
 
-------------------------------------------------------------------------
+A deposit or trade for a client whose dimension row has not loaded yet. Present in this
+data: `DEP020` → `CL031` and `VDEP020` → `CL099`, neither of which exists in
+`client_signup.json`.
 
-# 5. `dim_client_profile_scd2`
+Three common responses, two of which are wrong:
 
-This is the key historical dimension required for the assessment.
+- Drop the fact → understates deposits. Unacceptable for financial data.
+- Null the FK → breaks the star and silently excludes rows from every dimensional query.
+- **Inferred member** → correct.
 
-## 5.1 Why SCD Type 2?
+**The approach:** on encountering an unknown `client_id`, the pipeline inserts a stub
+dimension row with `is_inferred = TRUE`, `full_name = 'UNKNOWN'`, `risk_category = 'unknown'`,
+and `valid_from = '1900-01-01'` so it covers any historical fact date. The fact loads
+immediately with a valid `client_sk`; totals stay complete.
 
-Client profile attributes can change over time.
+When the real dimension record arrives, the stub is **upgraded in place** — the same
+`client_sk` is updated with real attributes and `is_inferred` cleared. Because the
+surrogate key never changes, **facts already loaded do not need restating**. That is the
+whole point of using a surrogate key rather than the natural key on the fact.
 
-For example:
+Verified: `Inferred dimension member created for late/unknown client CL031`.
 
-``` text
-Client CL001
-risk_level = LOW
-       |
-       | profile update
-       v
-risk_level = HIGH
+Inferred members are monitored: an inferred row older than 7 days means the dimension feed
+is genuinely broken, not merely late, and alerts. Without that, the stub mechanism quietly
+hides a broken upstream.
+
+One temporal nuance this surfaces: `TRD005` is a trade by `CL007` on **2024-02-20**, but
+`CL007`'s `signup_date` is **2024-03-15** — activity 24 days before the client existed.
+The fact loads and joins to `CL007`'s earliest dimension version (whose `valid_from` is
+open-ended precisely for this reason), and a WARN flags the temporal inconsistency for the
+source team rather than silently dropping a real trade.
+
+---
+
+## 2b. Historization (SCD)
+
+### 2b.1 Which SCD type, and why
+
+**SCD Type 2 on `risk_category` and `account_status`. SCD Type 4 (history table + daily
+snapshot) on `account_balance_usd`.**
+
+A blanket "Type 2 on all three" is the obvious answer and it is subtly wrong here.
+
+**Why Type 2 for `risk_category` and `account_status`:**
+
+These are low-velocity, high-consequence attributes. `risk_category` drives margin limits
+and regulatory treatment; `account_status` drives whether a client can trade. When a
+regulator asks *"was this client classified high-risk when that trade was placed?"*, only
+Type 2 can answer. Type 1 would overwrite the answer and destroy the evidence.
+Change frequency in this feed is low — `CL014`, `CL009`, `CL025` each change
+`risk_category` once — so version growth is manageable.
+
+**Why not Type 2 for `account_balance_usd`:**
+
+Balance changes on **every deposit, withdrawal and closed trade**. Putting it in the same
+SCD2 row as `risk_category` means a new dimension version per balance movement. With 30
+clients that is invisible; with 500,000 active clients trading daily it produces tens of
+millions of dimension versions per year, and the dimension stops being slowly changing.
+Worse, it pollutes the risk history: querying "when did risk change" returns hundreds of
+rows where only the balance moved.
+
+This dataset already shows the pattern. Of `CL001`'s three changes, `lsn 1005` is a pure
+balance move ($1,250 → $1,850) with `risk_category` and `account_status` unchanged. It
+creates a dimension version that carries no risk information at all.
+
+So balance is versioned separately (Type 4) and aggregated from
+`fact_client_balance_snapshot`, keeping `dim_client` genuinely slowly-changing.
+
+**Pragmatic note on the implementation.** The prototype currently tracks all three in the
+SCD2 hash, because at 30 clients the split is not yet worth the extra object — and I would
+rather ship the simple version and show the migration path than build for a scale that
+does not exist. The hash column `record_hash` is the single place that decides what
+constitutes a new version, so the split is a one-line change plus a backfill.
+
+**Trade-offs:**
+
+| Option | For | Against | Verdict |
+|---|---|---|---|
+| **Type 1** (overwrite) | Simplest, smallest, fastest | Destroys history; cannot answer point-in-time; unacceptable for a regulated risk attribute | Used only for `dim_instrument`, `dim_payment_method` |
+| **Type 2** (versioned rows) | Full point-in-time truth; the regulatory answer | Table growth; every query needs `is_current` or a date predicate; a forgotten filter silently fans out joins | **Chosen** for `risk_category`, `account_status` |
+| **Type 3** (previous-value column) | Cheap "what changed last" | Only one step of history — `CL001` has three changes and Type 3 would lose one | Rejected |
+| **Type 4** (history table / snapshot) | Keeps the volatile measure out of the dimension | Extra object; consumers must know where to look | **Chosen** for `account_balance_usd` |
+| **Type 6** (hybrid 1+2+3) | Current and historical in one row | Update amplification: every change rewrites all versions of that key | Rejected — write cost on a high-churn attribute |
+
+### 2b.2 Update and delete handling
+
+Full SQL: `sql/04_scd2_dim_client_merge.sql`.
+
+**Step 0 — order the batch.** This is the step that makes the rest correct.
+
+```sql
+WITH ordered AS (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY client_id ORDER BY lsn) AS rn,
+            LEAD(commit_ts) OVER (PARTITION BY client_id ORDER BY lsn) AS next_commit_ts
+  FROM bronze_client_profile_changes
+  WHERE lsn > (SELECT COALESCE(MAX(lsn), 0) FROM cdc_apply_log)   -- replay guard
+)
 ```
 
-The analytical system must preserve both versions so that historical
-reports can answer:
+Sorting by `lsn`, never by `commit_ts` or arrival order. `CL001`'s `1004`/`1005`/`1006`
+share a commit date and arrive out of order; only `lsn` gives a total order.
 
-> What was the client's profile at the time of the transaction?
+**Step 1 — update.** Two-phase, because a single `MERGE` cannot both close the old row and
+insert the new one for the same key.
 
-Therefore, Type 2 is preferred over Type 1 for attributes whose
-historical values matter.
+*Phase A — close the current version:*
 
-------------------------------------------------------------------------
-
-## 5.2 SCD2 columns
-
-  Column                Purpose
-  --------------------- --------------------------------
-  `client_profile_sk`   Surrogate key for each version
-  `client_id`           Stable source/business key
-  profile attributes    Historical descriptive values
-  `effective_from_ts`   Start of validity
-  `effective_to_ts`     End of validity
-  `is_current`          Identifies current version
-  `is_deleted`          Represents source deletion
-  `source_lsn`          CDC ordering/audit information
-  `created_ts`          Warehouse creation timestamp
-  `updated_ts`          Warehouse update timestamp
-
-Open-ended current records use a standard high timestamp such as:
-
-``` text
-9999-12-31 23:59:59
+```sql
+MERGE INTO dim_client t
+USING ordered s
+  ON t.client_id = s.client_id AND t.is_current = TRUE
+WHEN MATCHED AND s.op IN ('update','delete')
+     AND t.record_hash <> s.new_record_hash          -- no-op if nothing changed
+  THEN UPDATE SET t.valid_to = s.commit_ts, t.is_current = FALSE, t.updated_at = current_timestamp();
 ```
 
-------------------------------------------------------------------------
+*Phase B — insert the new version*, carrying forward attributes absent from the partial
+`after` image:
 
-# 6. SCD Type 2 Processing
-
-## 6.1 Insert
-
-When a new client profile arrives:
-
-``` text
-No existing client_id
-        |
-        v
-Insert new SCD2 version
-is_current = true
-is_deleted = false
+```sql
+INSERT INTO dim_client
+SELECT sha2(concat(s.client_id, s.commit_ts), 256) AS client_sk,
+       s.client_id,
+       COALESCE(s.after.full_name,     p.full_name)     AS full_name,
+       COALESCE(s.after.risk_category, p.risk_category) AS risk_category,
+       ...
+       s.commit_ts AS valid_from, TIMESTAMP'9999-12-31' AS valid_to,
+       TRUE AS is_current, FALSE AS is_deleted, s.lsn AS source_lsn
+FROM ordered s LEFT JOIN dim_client p
+  ON p.client_id = s.client_id AND p.valid_to = s.commit_ts;
 ```
 
-Example:
+The `COALESCE` is essential: `after` carries only the three changed fields, so a naive
+insert would null `full_name`, `nationality` and `preferred_language` on every update.
 
-``` text
-CL001 | LOW | 2024-03-01 | 9999-12-31 | true
+The `record_hash` comparison makes a no-change event a genuine no-op — which is what makes
+`lsn 1001` (re-inserting `CL030` with identical attributes) correctly produce **no new
+version**.
+
+**Step 2 — delete.** Phase A above already end-dates the current row. Then a tombstone:
+
+```sql
+INSERT INTO dim_client
+SELECT sha2(concat(s.client_id, s.commit_ts), 256), s.client_id,
+       p.full_name, p.date_of_birth, ... ,          -- last known values retained
+       s.commit_ts AS valid_from, TIMESTAMP'9999-12-31' AS valid_to,
+       TRUE AS is_current, TRUE AS is_deleted,      -- <-- tombstone
+       s.lsn AS source_lsn, 'delete' AS source_op
+FROM ordered s JOIN dim_client p ON p.client_id = s.client_id AND p.valid_to = s.commit_ts
+WHERE s.op = 'delete';
 ```
 
-------------------------------------------------------------------------
+**What happens in the warehouse when a delete arrives** (`lsn 1010`, `CL012`):
 
-## 6.2 Update
+| | |
+|---|---|
+| Physical rows deleted | **Zero** |
+| Prior version | `valid_to` closed at `2024-11-21 14:00:00`, `is_current = FALSE` |
+| New version | Tombstone with `is_deleted = TRUE`, last known attributes retained |
+| `fact_deposit` rows for `CL012` (`DEP008`, `VDEP004`) | Still join successfully |
+| Current-state reports | Exclude `CL012` via `WHERE is_deleted = FALSE` |
+| Point-in-time report for October 2024 | Still shows `CL012` as active — correct, because it was |
+| Audit trail | `cdc_apply_log` row: `lsn 1010`, `action_taken = 'soft_delete_tombstone'` |
 
-Suppose CDC contains:
+**Step 3 — record the watermark.** Every applied `lsn` is written to `cdc_apply_log` in the
+same transaction as the dimension write. Delta's ACID guarantee means the watermark cannot
+advance without the data landing, and vice versa. Without that atomicity, a failure between
+the two produces either silently skipped events or infinitely reapplied ones.
 
-``` text
-client_id = CL001
-op = update
-lsn = 105
-risk_level = HIGH
+**On LSN gaps.** This feed has gaps: `1002, 1007, 1011, 1013, 1014, 1016, 1017, 1019`.
+These are *expected* — a database transaction log is shared across all tables, so gaps are
+transactions against other tables. Alerting on every gap would produce constant false
+pages. We track the high-water mark and alert only if a gap remains unfilled past the
+completeness SLA, which distinguishes "this LSN was for another table" from "we lost data".
+
+**Why not `AUTO CDC` / `APPLY CHANGES INTO`?** Databricks' AUTO CDC API (which replaced
+`APPLY CHANGES`, and is the current recommendation) would implement this declaratively —
+`STORED AS SCD TYPE 2` with `SEQUENCE BY lsn` handles reordering and end-dating natively,
+and is what I would reach for in production on a Lakeflow Pro/Advanced pipeline. I wrote
+the explicit `MERGE` here because it requires those pipeline editions, it obscures the
+reordering logic this assessment is asking me to demonstrate, and the partial-after-image
+`COALESCE` needs care either way. `sql/04_scd2_dim_client_merge.sql` includes the AUTO CDC
+equivalent as a commented alternative.
+
+### 2b.3 Reloading a historical date range without corrupting history
+
+Re-processing November 2024. The requirement is that history must survive — so a naive
+`DELETE WHERE month = 11` is disqualified immediately: it destroys SCD2 versions whose
+`valid_from` is in November but which are still the *current* version, orphaning every
+later fact.
+
+**The procedure:**
+
+**1. Bound the blast radius precisely.** The set to restate is not "rows whose `valid_from`
+is in November". It is every dimension version whose *validity interval overlaps* November:
+
+```sql
+WHERE valid_from < '2024-12-01' AND valid_to >= '2024-11-01'
 ```
 
-Existing version:
+A version opened in September and still open in November is affected by a November
+restatement. The naive predicate misses it.
 
-``` text
-CL001 | LOW  | 2024-01-01 | 9999-12-31 | true
+**2. Snapshot before touching anything.** Record the current Delta version so the whole
+operation is reversible:
+
+```sql
+DESCRIBE HISTORY dim_client;          -- note version N
+-- rollback if needed:
+RESTORE TABLE dim_client TO VERSION AS OF N;
 ```
 
-Processing creates:
+This is the real safety net. Delta time travel means a botched backfill is a one-statement
+recovery rather than an incident.
 
-``` text
-CL001 | LOW  | 2024-01-01 | 2024-03-10 | false
-CL001 | HIGH | 2024-03-10 | 9999-12-31 | true
+**3. Rewind the CDC watermark, do not delete rows.**
+
+```sql
+DELETE FROM cdc_apply_log WHERE commit_ts >= '2024-11-01' AND commit_ts < '2024-12-01';
 ```
 
-The previous version is never overwritten.
+The watermark is control data, not history. Removing these entries makes the pipeline
+eligible to reprocess exactly that window.
 
-### Transactional approach
+**4. Surgically unwind the affected dimension versions.** Delete only versions *created by*
+the LSNs being replayed, then reopen the version that preceded them:
 
-The implementation should:
+```sql
+DELETE FROM dim_client
+WHERE source_lsn IN (SELECT lsn FROM bronze_client_profile_changes
+                     WHERE commit_ts >= '2024-11-01' AND commit_ts < '2024-12-01');
 
-1.  identify the latest valid CDC event per client
-2.  validate LSN ordering
-3.  close the existing current version
-4.  insert the new version
-5.  record the applied LSN
-6.  write an audit record
-
-These operations should be executed as one logical Delta transaction
-where possible.
-
-------------------------------------------------------------------------
-
-# 7. Delete Handling
-
-Physical deletion is explicitly prohibited for this solution.
-
-When a CDC delete arrives:
-
-``` text
-op = delete
+MERGE INTO dim_client t
+USING (SELECT client_id, MAX(valid_from) AS vf FROM dim_client GROUP BY client_id) s
+  ON t.client_id = s.client_id AND t.valid_from = s.vf
+WHEN MATCHED THEN UPDATE SET t.valid_to = TIMESTAMP'9999-12-31', t.is_current = TRUE;
 ```
 
-the current record is closed and a terminal soft-deleted version is
-inserted.
+Versions created *outside* November are never touched. October's history is untouched by
+construction, not by hope.
 
-Example:
+**5. Replay.** Re-run the standard CDC merge. Because it is ordered by `lsn` and guarded by
+`cdc_apply_log`, it rebuilds exactly the same November timeline — deterministically. Same
+inputs, same LSN order, same output.
 
-Before:
+**6. Restate the facts by partition, not by delete-insert.**
 
-``` text
-CL001 | ACTIVE | 2024-01-01 | 9999-12-31 | true | false
+```python
+(df.write.format("delta").mode("overwrite")
+   .option("replaceWhere", "date_key >= 20241101 AND date_key <= 20241130")
+   .saveAsTable("gold.fact_deposit"))
 ```
 
-After:
+`replaceWhere` is atomic: readers see either the old November or the new November, never a
+half-loaded month. A `DELETE` + `INSERT` pair exposes an empty window to anyone querying
+mid-run — which, for a C-suite report, means a zero where there should be revenue.
 
-``` text
-CL001 | ACTIVE  | 2024-01-01 | 2024-03-20 | false | false
-CL001 | DELETED | 2024-03-20 | 9999-12-31 | true  | true
+**7. Verify before releasing.** Compare control totals against the pre-backfill snapshot
+and assert the SCD2 invariants below. Only then publish.
+
+**Invariants asserted after every backfill** (`sql/08_backfill_restatement.sql`):
+
+```sql
+-- exactly one current version per non-deleted client
+SELECT client_id, COUNT(*) FROM dim_client WHERE is_current GROUP BY 1 HAVING COUNT(*) > 1;
+-- no gaps or overlaps in any client's timeline
+SELECT client_id FROM (
+  SELECT client_id, valid_to, LEAD(valid_from) OVER (PARTITION BY client_id ORDER BY valid_from) nxt
+  FROM dim_client) WHERE nxt IS NOT NULL AND nxt <> valid_to;
+-- no version opens after it closes
+SELECT * FROM dim_client WHERE valid_from >= valid_to;
 ```
 
-The delete event itself is retained in the CDC/audit history.
-
-This provides:
-
--   historical traceability
--   regulatory/audit support
--   reproducibility
--   protection against accidental data loss
-
-Hard delete is not used.
-
-------------------------------------------------------------------------
-
-# 8. Multiple Updates and Out-of-Order CDC
-
-CDC events are not guaranteed to arrive in LSN order.
-
-Example:
-
-``` text
-arrival order:
-LSN 108
-LSN 106
-LSN 107
-```
-
-The solution must not simply apply records in arrival order.
-
-## Processing strategy
-
-For each microbatch:
-
-1.  read CDC events
-2.  validate required fields
-3.  remove already-applied LSNs
-4.  order events by `client_id, lsn`
-5.  detect stale events
-6.  apply valid events in LSN order
-7.  record successfully applied LSNs
-8.  quarantine invalid/stale events
-
-This protects the SCD2 timeline from moving backwards.
-
-### Important production consideration
-
-The current assessment implementation may process a microbatch
-sequentially for deterministic behavior. For a very high-volume
-production CDC workload, driver-side `collect()` should not be used. A
-scalable implementation should use stateful/event-time processing or a
-CDC framework capable of maintaining ordering and deduplication at
-scale.
-
-------------------------------------------------------------------------
-
-# 9. Fact Table Design
-
-## 9.1 `fact_deposit`
-
-### Grain
-
-**One row per accepted deposit transaction.**
-
-Business key:
-
-``` text
-deposit_id
-```
-
-Measures:
-
--   `amount_usd`
--   `amount_original`
--   `exchange_rate`
--   `fee_usd`
--   `processing_days`
-
-Dimensions:
-
--   client
--   client profile
--   date
--   payment method
-
-Example analytical query:
-
-``` sql
-SELECT
-    d.calendar_year,
-    d.month_num,
-    SUM(f.amount_usd) AS total_deposits
-FROM fact_deposit f
-JOIN dim_date d
-  ON f.deposit_date_sk = d.date_sk
-GROUP BY d.calendar_year, d.month_num;
-```
-
-------------------------------------------------------------------------
-
-# 10. `fact_trade`
-
-### Grain
-
-**One row per accepted trade.**
-
-Business key:
-
-``` text
-trade_id
-```
-
-Typical measures:
-
--   `quantity`
--   `price`
--   `notional_usd`
--   `fee_usd`
-
-Dimensions:
-
--   client
--   client profile
--   instrument
--   trade date
-
-Example:
-
-``` sql
-SELECT
-    i.instrument_name,
-    SUM(f.notional_usd) AS traded_notional
-FROM fact_trade f
-JOIN dim_instrument i
-  ON f.instrument_sk = i.instrument_sk
-GROUP BY i.instrument_name;
-```
-
-------------------------------------------------------------------------
-
-# 11. Why Store `profile_sk` in Facts?
-
-This is important for historical correctness.
-
-Suppose:
-
-``` text
-March 1:
-Client CL001 risk_level = LOW
-
-March 15:
-Client CL001 risk_level = HIGH
-
-March 10 trade:
-trade_id = T100
-```
-
-The trade should resolve to the profile version valid on March 10.
-
-Therefore:
-
-``` text
-T100 -> client_sk -> CL001
-     -> profile_sk -> LOW profile version
-```
-
-A future query should not accidentally attach the March 10 trade to the
-client's current HIGH-risk profile.
-
-This is a major reason to use a surrogate SCD2 key in the fact table.
-
-------------------------------------------------------------------------
-
-# 12. Late-Arriving Dimensions
-
-A transaction may arrive before its dimension record.
-
-Example:
-
-``` text
-Trade T100 arrives
-client_id = CL099
-
-Client dimension CL099 not yet available
-```
-
-The fact should not be silently dropped.
-
-## Strategy
-
-Create an inferred/unknown dimension member:
-
-``` text
-client_sk = -1
-client_id = CL099
-is_inferred = true
-```
-
-The fact can then be loaded:
-
-``` text
-T100 -> client_sk = -1
-```
-
-When the real client dimension arrives:
-
-1.  update the inferred dimension record
-2.  assign the real client attributes
-3.  mark `is_inferred = false`
-4.  update affected fact foreign keys if required by the serving model
-5.  reconcile the affected records
-
-For SCD2 dimensions, the effective timestamp of the actual dimension
-record must be respected when resolving the fact.
-
-------------------------------------------------------------------------
-
-# 13. Unknown Member
-
-A permanent unknown member should also exist.
-
-Example:
-
-``` text
-client_sk = 0
-client_id = UNKNOWN
-```
-
-Use cases include:
-
--   missing client ID
--   invalid source reference
--   data-quality fallback
--   historical records where the source dimension genuinely cannot be
-    resolved
-
-The unknown member prevents nullable foreign keys from spreading through
-the star schema.
-
-------------------------------------------------------------------------
-
-# 14. Historical Reload Strategy
-
-Historical reloads are dangerous because a naive overwrite can destroy
-SCD2 history.
-
-## Incorrect approach
-
-``` text
-DROP TABLE
-RELOAD CURRENT DATA
-```
-
-This destroys:
-
--   old profile versions
--   historical auditability
--   transaction-to-profile relationships
-
-## Recommended approach
-
-### Step 1 --- Isolate the reload
-
-Load source data into a temporary/staging Delta table.
-
-``` text
-source
-  |
-  v
-staging_reload
-```
-
-### Step 2 --- Validate
-
-Run:
-
--   row-count checks
--   duplicate checks
--   null checks
--   referential-integrity checks
--   amount/business-rule checks
--   source-to-target reconciliation
-
-### Step 3 --- Rebuild only affected scope
-
-For fact data, identify affected business dates/keys and rebuild that
-scope.
-
-For dimensions, preserve existing SCD2 versions and reconstruct affected
-versions based on source effective timestamps/CDC history.
-
-### Step 4 --- Atomic publish
-
-Use Delta transactional operations such as `MERGE` or controlled
-partition replacement.
-
-Do not expose a partially rebuilt table to consumers.
-
-### Step 5 --- Reconcile
-
-Compare:
-
-``` text
-source count
-target count
-inserted
-updated
-rejected
-quarantined
-```
-
-and verify key-level totals.
-
-------------------------------------------------------------------------
-
-# 15. Historical Reload Example
-
-Suppose the March 10 deposit file is reprocessed.
-
-The process should:
-
-``` text
-March 10 source
-      |
-      v
-staging_deposit_reload
-      |
-      +--> DQ validation
-      |
-      +--> deduplication
-      |
-      +--> reconciliation
-      |
-      v
-affected fact_deposit scope
-      |
-      v
-atomic MERGE/replacement
-```
-
-Existing client-profile SCD2 history should not be deleted as part of
-the deposit reload.
-
-If the reload also changes profile history, the CDC/source history must
-be replayed in LSN/effective-time order and the resulting SCD2 timeline
-reconciled.
-
-------------------------------------------------------------------------
-
-# 16. Source Key vs Surrogate Key
-
-The model deliberately separates these concepts.
-
-  Key                   Purpose
-  --------------------- -----------------------------------
-  `client_id`           Stable source/business identifier
-  `client_sk`           Warehouse surrogate key
-  `client_profile_sk`   Unique SCD2 profile version
-  `deposit_id`          Deposit business key
-  `trade_id`            Trade business key
-  `instrument_id`       Instrument business key
-
-This allows source systems to retain their identifiers while the
-warehouse controls historical dimension relationships.
-
-------------------------------------------------------------------------
-
-# 17. Referential Integrity
-
-Before facts become Gold/serving data:
-
-``` text
-fact_deposit.client_sk
-        |
-        +--> dim_client
-
-fact_deposit.profile_sk
-        |
-        +--> dim_client_profile_scd2
-
-fact_trade.instrument_sk
-        |
-        +--> dim_instrument
-```
-
-Any unresolved required relationship should either:
-
--   resolve to an unknown/inferred member, or
--   be quarantined when the business rule says the record is invalid.
-
-The chosen behavior must be measurable and reconciled.
-
-------------------------------------------------------------------------
-
-# 18. SCD2 Quality Checks
-
-The following checks should run as part of data-quality validation.
-
-### More than one current profile
-
-``` sql
-SELECT
-    client_id,
-    COUNT(*) AS current_count
-FROM dim_client_profile_scd2
-WHERE is_current = true
-GROUP BY client_id
-HAVING COUNT(*) > 1;
-```
-
-Expected result:
-
-``` text
-0 rows
-```
-
-### Overlapping versions
-
-``` sql
--- Conceptual validation:
--- for each client_id, the next effective_from_ts
--- must be >= the previous effective_to_ts.
-```
-
-### Deleted client validation
-
-``` sql
-SELECT *
-FROM dim_client_profile_scd2
-WHERE is_deleted = true
-  AND is_current = true
-  AND account_status <> 'deleted';
-```
-
-Expected result:
-
-``` text
-0 rows
-```
-
-### Duplicate facts
-
-``` sql
-SELECT deposit_id, COUNT(*)
-FROM fact_deposit
-GROUP BY deposit_id
-HAVING COUNT(*) > 1;
-```
-
-Expected result:
-
-``` text
-0 rows
-```
-
-------------------------------------------------------------------------
-
-# 19. Dimensional Model and Gold Layer
-
-The Silver layer is responsible for:
-
--   canonical schemas
--   DQ
--   deduplication
--   CDC processing
--   SCD2 history
--   referential integrity
-
-The Gold dimensional layer is responsible for:
-
--   analytics-ready facts
--   conformed dimensions
--   surrogate-key resolution
--   business metrics
--   BI and downstream consumption
-
-This separation prevents analytical consumers from having to understand
-raw source behavior.
-
-------------------------------------------------------------------------
-
-# 20. Recommended Gold Tables
-
-``` text
-workspace.deriv_assement_gold.dim_client
-workspace.deriv_assement_gold.dim_client_profile_scd2
-workspace.deriv_assement_gold.dim_date
-workspace.deriv_assement_gold.dim_instrument
-workspace.deriv_assement_gold.dim_payment_method
-
-workspace.deriv_assement_gold.fact_deposit
-workspace.deriv_assement_gold.fact_trade
-```
-
-The exact physical names can be adapted to the organization's
-catalog/schema conventions.
-
-------------------------------------------------------------------------
-
-# 21. Design Decisions and Trade-offs
-
-  Decision                          Reason
-  --------------------------------- ---------------------------------------------
-  Kimball star schema               Simple and efficient analytical consumption
-  Separate SCD2 profile dimension   Preserves client-profile history
-  Surrogate keys                    Correct historical relationships
-  Business keys retained            Traceability to source
-  Soft delete                       Required auditability and no hard deletion
-  Unknown member                    Prevents broken dimensional relationships
-  Inferred member                   Supports late-arriving dimensions
-  Delta MERGE                       Idempotent incremental processing
-  Atomic historical reload          Prevents partial/inconsistent publication
-  CDC ordered by LSN                Protects temporal correctness
-  Fact grain explicitly defined     Prevents accidental double counting
-
-------------------------------------------------------------------------
-
-# 22. End-to-End Historical Example
-
-Consider:
-
-``` text
-01-Mar
-CL001 profile = LOW
-
-10-Mar
-Trade T100 occurs
-
-15-Mar
-CL001 profile changes LOW -> HIGH
-
-20-Mar
-CL001 is deleted
-```
-
-The SCD2 dimension becomes conceptually:
-
-``` text
-client_id | risk | from       | to         | current | deleted
-----------|------|------------|------------|---------|--------
-CL001     | LOW  | 01-Mar     | 15-Mar     | false   | false
-CL001     | HIGH | 15-Mar     | 20-Mar     | false   | false
-CL001     | DEL  | 20-Mar     | 9999-12-31 | true   | true
-```
-
-Trade `T100`, occurring on March 10, points to the LOW profile surrogate
-key.
-
-Therefore historical analytics remain correct even after the client
-becomes HIGH risk and is later deleted.
-
-------------------------------------------------------------------------
-
-# 23. Part 2 Completion Checklist
-
--   [x] Dimensional model defined
--   [x] Fact grains explicitly defined
--   [x] Client dimension defined
--   [x] Client Profile SCD2 dimension defined
--   [x] Date dimension defined
--   [x] Instrument dimension defined
--   [x] Payment Method dimension defined
--   [x] Deposit fact defined
--   [x] Trade fact defined
--   [x] Surrogate keys defined
--   [x] Business/source keys retained
--   [x] SCD2 update handling defined
--   [x] SCD2 delete handling defined
--   [x] Soft delete/end-dating defined
--   [x] Out-of-order CDC handling defined
--   [x] Late-arriving dimension strategy defined
--   [x] Unknown/inferred members defined
--   [x] Historical reload strategy defined
--   [x] SCD2 validation checks defined
--   [x] Historical example included
-
-------------------------------------------------------------------------
-
-## 24. Implementation Alignment
-
-The Part 2 model is designed to align with the Part 1 pipeline:
-
-``` text
-Batch JSON
-    |
-    v
-Bronze
-    |
-    v
-Silver canonical entities
-    |
-    +--------------------+
-    |                    |
-    v                    v
-Current dimensions     SCD2 profile
-    |                    |
-    +---------+----------+
-              |
-              v
-        Gold dimensions
-              |
-              v
-        Gold fact tables
-```
-
-The model therefore separates ingestion concerns from analytical
-modeling concerns while preserving source traceability and historical
-correctness.
+All three return zero rows on the current build.
+
+**Why this is safe overall:** the backfill is re-derivation, not mutation. Bronze is
+append-only and still holds every original CDC event, so November's history is rebuilt
+from the same immutable source that produced it the first time. Nothing is edited in
+place; the only destructive step is scoped to versions the replay will itself recreate,
+and Delta `RESTORE` covers even that.
