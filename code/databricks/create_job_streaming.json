@@ -1,0 +1,40 @@
+{
+  "name": "deriv_assessment_bronze_streaming_continuous",
+  "description": "Always-on Auto Loader ingestion of the vendor deposit CSV and client-profile CDC JSONL feeds from the stream landing volume into Bronze. Single task by design: a continuous task never reaches a terminal state, so nothing can depend on it. Silver/Gold are driven by the file-arrival job in create_job_batch.json.",
+  "max_concurrent_runs": 1,
+  "tags": {
+    "project": "deriv_assessment",
+    "layer": "bronze",
+    "mode": "continuous"
+  },
+  "continuous": {
+    "pause_status": "PAUSED"
+  },
+  "tasks": [
+    {
+      "task_key": "bronze_autoloader_continuous",
+      "description": "Two Auto Loader queries, micro-batching every minute. trigger_mode=continuous makes the notebook start both queries and then block on awaitAnyTermination, so a failure in either feed fails the run instead of leaving one feed silently stalled.",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/deriv-assessment/code/databricks/02_bronze_streaming_autoloader",
+        "source": "WORKSPACE",
+        "base_parameters": {
+          "trigger_mode": "continuous"
+        }
+      }
+    }
+  ],
+  "email_notifications": {
+    "on_failure": [
+      "dj.apple32588@gmail.com"
+    ]
+  },
+  "health": {
+    "rules": [
+      {
+        "metric": "RUN_DURATION_SECONDS",
+        "op": "GREATER_THAN",
+        "value": 86400
+      }
+    ]
+  }
+}

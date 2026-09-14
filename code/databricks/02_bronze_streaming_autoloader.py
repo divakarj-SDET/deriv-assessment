@@ -63,6 +63,32 @@ CDC_SCHEMA_LOCATION = f"{CHECKPOINT_BASE}schemas/client_profile_changes/"
 
 STREAM_QUERY_PREFIX = "deriv_bronze_"
 
+# trigger_mode selects how the two Auto Loader queries terminate:
+#
+#   availableNow  process every file currently present, then stop. Both queries reach
+#                 a terminal state, so the notebook can be a task in a sequential job
+#                 and the validation cells at the end actually run. Default, and what
+#                 interactive use wants.
+#   continuous    micro-batch every PROCESSING_TIME and never stop. For the continuous
+#                 job, where the task is meant to stay alive.
+#
+# Declared as a widget so the job supplies it rather than the notebook being edited
+# between modes — an edited trigger is the kind of thing that gets committed by accident.
+dbutils.widgets.text("trigger_mode", "availableNow")
+TRIGGER_MODE = dbutils.widgets.get("trigger_mode").strip()
+
+if TRIGGER_MODE not in ("availableNow", "continuous"):
+    raise ValueError(
+        f"trigger_mode must be 'availableNow' or 'continuous', got '{TRIGGER_MODE}'")
+
+PROCESSING_TIME = "1 minute"
+
+def apply_trigger(writer):
+    """Apply the trigger selected by trigger_mode."""
+    if TRIGGER_MODE == "continuous":
+        return writer.trigger(processingTime=PROCESSING_TIME)
+    return writer.trigger(availableNow=True)
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -206,29 +232,21 @@ deposit_bronze_df = (
 # MAGIC %md
 # MAGIC ## Deposit streaming write
 # MAGIC
-# MAGIC `availableNow=True` is useful for the assessment because it processes
-# MAGIC all currently available files and then stops.
-# MAGIC
-# MAGIC For continuously arriving files, replace `availableNow=True` with:
-# MAGIC
-# MAGIC ```python
-# MAGIC .trigger(processingTime="1 minute")
-# MAGIC ```
+# MAGIC Both queries are **started** here and in the CDC cell below, and neither is
+# MAGIC awaited until both are running. Awaiting the deposit query at the point it is
+# MAGIC started would deadlock in `continuous` mode: the call never returns, so the CDC
+# MAGIC query would never be started at all and that feed would silently ingest nothing.
 
 # COMMAND ----------
 
-deposit_query = (
+deposit_query = apply_trigger(
     deposit_bronze_df.writeStream
     .format("delta")
     .outputMode("append")
     .option("checkpointLocation", DEPOSIT_CHECKPOINT)
     .queryName(deposit_query_name)
     .partitionBy("delta_created_dt")
-    .trigger(availableNow=True)
-    .toTable(DEPOSIT_TARGET)
-)
-
-deposit_query.awaitTermination()
+).toTable(DEPOSIT_TARGET)
 
 # COMMAND ----------
 
@@ -293,18 +311,35 @@ cdc_bronze_df = (
 
 # COMMAND ----------
 
-cdc_query = (
+cdc_query = apply_trigger(
     cdc_bronze_df.writeStream
     .format("delta")
     .outputMode("append")
     .option("checkpointLocation", CDC_CHECKPOINT)
     .queryName(cdc_query_name)
     .partitionBy("delta_created_dt")
-    .trigger(availableNow=True)
-    .toTable(CDC_TARGET)
-)
+).toTable(CDC_TARGET)
 
-cdc_query.awaitTermination()
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Await both queries
+# MAGIC
+# MAGIC `awaitAnyTermination` raises as soon as *either* query fails, rather than waiting
+# MAGIC for a healthy query while a dead one silently stops ingesting. In `continuous`
+# MAGIC mode this cell never returns, so the validation cells below are reached only in
+# MAGIC `availableNow` mode — monitor the continuous job from the job run page instead.
+
+# COMMAND ----------
+
+if TRIGGER_MODE == "continuous":
+    print(f"Continuous mode: micro-batching every {PROCESSING_TIME}. "
+          f"This cell blocks until a query fails or the run is cancelled.")
+    spark.streams.awaitAnyTermination()
+else:
+    deposit_query.awaitTermination()
+    cdc_query.awaitTermination()
+    print("availableNow mode: both queries drained all available files and stopped.")
 
 # COMMAND ----------
 

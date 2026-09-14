@@ -44,7 +44,9 @@ runnable local prototype in DuckDB so every claim can be verified without a clus
 │   │   ├── 03_silver_vendor_deposits.py       DQ gate, dedupe, MERGE
 │   │   ├── 04_silver_cdc_scd2.py              LSN-ordered SCD2 with soft deletes
 │   │   ├── 05_gold_dimensional.py             Star schema, inferred members, PnL control
-│   │   └── 06_reconciliation.py               Two-tier reconciliation
+│   │   ├── 06_reconciliation.py               Two-tier reconciliation
+│   │   ├── create_job_streaming.json          Continuous Auto Loader job
+│   │   └── create_job_batch.json              File-arrival batch job (01 → 06)
 │   └── prototype/
 │       └── run_pipeline.py                    Runnable, idempotent, end-to-end
 └── data/                                      Eight source files
