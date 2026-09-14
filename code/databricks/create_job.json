@@ -1,0 +1,124 @@
+{
+  "name": "deriv_assessment_medallion_pipeline",
+  "description": "Sequential medallion pipeline: Bronze batch JSON -> Bronze Auto Loader -> Silver -> Gold -> reconciliation. Each task depends on the previous one, so nothing downstream runs on a failed upstream load.",
+  "max_concurrent_runs": 1,
+  "timeout_seconds": 7200,
+  "tags": {
+    "project": "deriv_assessment",
+    "layer": "medallion",
+    "owner": "data_engineering"
+  },
+  "queue": {
+    "enabled": true
+  },
+  "tasks": [
+    {
+      "task_key": "bronze_batch_json",
+      "description": "Batch JSON -> Bronze. Advances bronze_load_master only on success, then archives consumed files to /Volumes/workspace/deriv_assement/data/archive/{table}/{load_ts}/.",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/deriv-assessment/code/databricks/01_bronze_batch_json",
+        "source": "WORKSPACE"
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 2,
+      "min_retry_interval_millis": 60000,
+      "retry_on_timeout": false
+    },
+    {
+      "task_key": "bronze_autoloader",
+      "description": "Auto Loader -> Bronze for the vendor CSV and CDC JSONL feeds. Runs with trigger(availableNow=True) and awaitTermination(), so the task completes once the currently available files are processed and the job can continue in sequence.",
+      "depends_on": [
+        {
+          "task_key": "bronze_batch_json"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/deriv-assessment/code/databricks/02_bronze_streaming_autoloader",
+        "source": "WORKSPACE"
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 2,
+      "min_retry_interval_millis": 60000,
+      "retry_on_timeout": true
+    },
+    {
+      "task_key": "silver_vendor_deposits",
+      "description": "Bronze -> Silver for the vendor deposit feed: declared alias map, DQ gate, dedupe on deposit_id, idempotent MERGE, quarantine release.",
+      "depends_on": [
+        {
+          "task_key": "bronze_autoloader"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/deriv-assessment/code/databricks/03_silver_vendor_deposits",
+        "source": "WORKSPACE"
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1,
+      "min_retry_interval_millis": 60000,
+      "retry_on_timeout": false
+    },
+    {
+      "task_key": "silver_cdc_scd2",
+      "description": "CDC -> dim_client SCD2, applied in LSN order with soft deletes. Reads its own lsn watermark from cdc_apply_log.",
+      "depends_on": [
+        {
+          "task_key": "silver_vendor_deposits"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/deriv-assessment/code/databricks/04_silver_cdc_scd2",
+        "source": "WORKSPACE"
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1,
+      "min_retry_interval_millis": 60000,
+      "retry_on_timeout": false
+    },
+    {
+      "task_key": "gold_dimensional",
+      "description": "Silver -> Gold star schema: conformed dimensions, inferred late-arriving members, fact tables at declared grain.",
+      "depends_on": [
+        {
+          "task_key": "silver_cdc_scd2"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/deriv-assessment/code/databricks/05_gold_dimensional",
+        "source": "WORKSPACE"
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1,
+      "min_retry_interval_millis": 60000,
+      "retry_on_timeout": false
+    },
+    {
+      "task_key": "reconciliation",
+      "description": "Two-tier vendor-to-warehouse reconciliation and control totals. Runs last so it reconciles a fully built warehouse.",
+      "depends_on": [
+        {
+          "task_key": "gold_dimensional"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/deriv-assessment/code/databricks/06_reconciliation",
+        "source": "WORKSPACE"
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 0,
+      "retry_on_timeout": false
+    }
+  ],
+  "schedule": {
+    "quartz_cron_expression": "0 0 2 * * ?",
+    "timezone_id": "UTC",
+    "pause_status": "PAUSED"
+  },
+  "email_notifications": {
+    "on_failure": [
+      "dj.apple32588@gmail.com"
+    ],
+    "no_alert_for_skipped_runs": false
+  },
+  "performance_target": "STANDARD"
+}

@@ -122,14 +122,20 @@ watermark = spark.sql(f"SELECT COALESCE(MAX(lsn), 0) AS m FROM {APPLY_LOG}").fir
 # Streaming Bronze, NOT master-driven: the Auto Loader checkpoint already ingests
 # each change file once, and the `lsn` watermark below is this notebook's own
 # incremental boundary. A delta_created_ts filter would hide un-applied changes.
+# Auto Loader ingests the CDC JSONL with inferColumnTypes left at its default of
+# false, so every Bronze column — `lsn` included — arrives as STRING. Typing is
+# Silver's job, and `lsn` must be cast BEFORE it is used: ordering a string column
+# sorts 1010 before 999, and the gap arithmetic below would raise
+# "can only concatenate str (not int) to str".
 cdc = (spark.table(f"{BRONZE}.stream_client_profile_changes")
+       .withColumn("lsn", F.col("lsn").cast("bigint"))
        .filter(F.col("lsn") > F.lit(watermark))
        .withColumn("commit_ts", F.col("commit_ts").cast("timestamp"))
        .orderBy("lsn"))                      # <-- THE critical line
 
 print(f"Watermark: {watermark}")
 print("Arrival order:", [r.lsn for r in spark.table(f"{BRONZE}.stream_client_profile_changes")
-                         .select("lsn").collect()])
+                         .select(F.col("lsn").cast("bigint")).collect()])
 print("Applied order:", [r.lsn for r in cdc.select("lsn").collect()])
 
 # LSN gaps are EXPECTED — a transaction log is shared across all tables, so a gap is a
